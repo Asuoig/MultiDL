@@ -1,0 +1,656 @@
+"""
+engine/core.py — 高性能多线程分段下载引擎 v2
+
+与 v1 的关键差异（都是为了打满带宽）：
+  · 单文件预分配 + 各连接独立句柄 seek/write —— 不再分块临时文件后合并，
+    省掉一整趟「读所有分块 + 写目标文件」的磁盘往返（大文件上是最大瓶颈之一）
+  · read1(256KB) 单次 recv，减少 Python 层循环次数
+  · 分块状态存旁车 JSON，进程重启可直接续传
+  · 自适应增连：追最慢连接，剩余时间 > 建连成本×系数才追加
+"""
+from __future__ import annotations
+
+import os
+import re
+import ssl
+import json
+import time
+import shutil
+import socket
+import threading
+import http.client
+import urllib.parse as up
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+MIN_CHUNK = 1 << 20
+MAX_CONN_HARD = 32
+GROW_POLL = 0.5
+HANDSHAKE_COST = 1.2
+READ_BLOCK = 1 << 18          # 256 KiB
+PART_SUFFIX = ".dlpart"
+META_SUFFIX = ".dlmeta"
+
+
+class NoRangeError(Exception):
+    pass
+
+
+class Aborted(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+class SpeedLimiter:
+    def __init__(self, bps: int = 0):
+        self.bps = int(bps)
+        self._lock = threading.Lock()
+        self._allow = 0.0
+        self._last = time.monotonic()
+
+    def set_bps(self, bps: int):
+        with self._lock:
+            self.bps = max(0, int(bps))
+            self._allow = 0.0
+            self._last = time.monotonic()
+
+    def consume(self, n: int, stop=lambda: False):
+        if not self.bps:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._allow += (now - self._last) * self.bps
+                self._last = now
+                cap = self.bps * 0.5
+                if self._allow > cap:
+                    self._allow = cap
+                if self._allow >= n:
+                    self._allow -= n
+                    return
+                need = n - self._allow
+            if stop():
+                raise Aborted()
+            time.sleep(min(0.2, max(0.01, need / self.bps)))
+
+
+# --------------------------------------------------------------------------
+class Chunk:
+    __slots__ = ("idx", "start", "end", "pos", "done", "error")
+
+    def __init__(self, idx, start, end):
+        self.idx = idx
+        self.start = start
+        self.end = end
+        self.pos = start
+        self.done = False
+        self.error = None
+
+    @property
+    def size(self):
+        return self.end - self.start + 1
+
+    @property
+    def remaining(self):
+        return 0 if self.done else max(0, self.end - self.pos + 1)
+
+    def d(self):
+        return [self.idx, self.start, self.end, self.pos, 1 if self.done else 0]
+
+    @classmethod
+    def load(cls, a):
+        c = cls(a[0], a[1], a[2])
+        c.pos = a[3]
+        c.done = bool(a[4])
+        return c
+
+
+# --------------------------------------------------------------------------
+class Conn:
+    """一条连接：负责一个分块的字节搬运。"""
+
+    def __init__(self, task: "Task", chunk: Chunk):
+        self.t = task
+        self.c = chunk
+        self.speed = 0.0
+        self._n = 0
+        self._t0 = time.monotonic()
+
+    def _open(self):
+        t = self.t
+        url = t.final_url or t.url
+        u = up.urlsplit(url)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        path = (u.path or "/") + (("?" + u.query) if u.query else "")
+
+        if u.scheme == "https":
+            conn = http.client.HTTPSConnection(
+                host, port, timeout=25,
+                context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=25)
+
+        h = dict(t.headers)
+        h.setdefault("User-Agent", t.ua or DEFAULT_UA)
+        h["Accept-Encoding"] = "identity"
+        h["Connection"] = "close"
+        if t.supports_range:
+            h["Range"] = f"bytes={self.c.pos}-{self.c.end}"
+            if t.etag:
+                h["If-Range"] = t.etag
+            elif t.last_modified:
+                h["If-Range"] = t.last_modified
+
+        conn.request("GET", path, headers=h)
+        resp = conn.getresponse()
+        self.conn = conn
+        self.resp = resp
+
+        if resp.status == 206:
+            return
+        if resp.status == 200:
+            if t.supports_range:
+                raise NoRangeError("ignored Range")
+            return
+        if resp.status == 416:
+            self.c.pos = self.c.end + 1
+            self.c.done = True
+            raise Aborted()
+        raise IOError(f"HTTP {resp.status} {resp.reason}")
+
+    def run(self, stop: threading.Event, pause: threading.Event,
+            limiter: SpeedLimiter, on_bytes):
+        t = self.t
+        path = t.part_path
+        # 每连接独立句柄，seek 到自己的写位置 —— 互不干扰，无需加锁
+        fh = open(path, "r+b", buffering=0)
+        try:
+            self._open()
+            buf = bytearray(READ_BLOCK)
+            while self.c.pos <= self.c.end:
+                if stop.is_set() or pause.is_set():
+                    raise Aborted()
+                want = min(READ_BLOCK, self.c.end - self.c.pos + 1)
+                mv = memoryview(buf)[:want]
+                n = self.resp.readinto(mv) if hasattr(self.resp, "readinto") else 0
+                if n == 0:
+                    data = self.resp.read1(want)
+                    n = len(data)
+                    if n == 0:
+                        raise IOError("unexpected EOF")
+                    mv = data
+                limiter.consume(n, stop=stop.is_set)
+                fh.seek(self.c.pos)
+                fh.write(mv if isinstance(mv, (bytes, bytearray)) else mv[:n])
+                self.c.pos += n
+                self._n += n
+                on_bytes(n)
+                now = time.monotonic()
+                dt = now - self._t0
+                if dt >= 0.35:
+                    self.speed = self._n / dt
+                    self._n = 0
+                    self._t0 = now
+            self.c.done = True
+        finally:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+    def eta(self):
+        if self.c.done:
+            return 0.0
+        return self.c.remaining / max(self.speed, 2048.0)
+
+
+# --------------------------------------------------------------------------
+class Task:
+    def __init__(self, url, target, *, headers=None, ua=None, referer=None,
+                 cookie=None, max_conn=8, task_id=None, filename_hint=None):
+        self.id = task_id or ("%d%03d" % (int(time.time() * 1000) % 10 ** 9,
+                                          abs(hash(url)) % 1000))
+        self.url = url
+        self.final_url = None
+        self.target = target
+        self.headers = dict(headers or {})
+        self.ua = ua or DEFAULT_UA
+        if referer:
+            self.headers.setdefault("Referer", referer)
+        if cookie:
+            self.headers.setdefault("Cookie", cookie)
+        self.max_conn = max(1, min(int(max_conn), MAX_CONN_HARD))
+        self.filename_hint = filename_hint
+
+        self.size = 0
+        self.etag = None
+        self.last_modified = None
+        self.content_type = None
+        self.supports_range = False
+        self.chunks: list[Chunk] = []
+
+        self.state = "queued"
+        self.message = ""
+        self.downloaded = 0
+        self.speed = 0.0
+        self.created = time.time()
+        self.finished = None
+
+        self.stop = threading.Event()
+        self.pause = threading.Event()
+        self._runner = False
+        self._lock = threading.Lock()
+        self._conns: list[Conn] = []
+        self._bytes = 0
+        self._t0 = None
+
+    # ---------- 路径 ----------
+    @property
+    def part_path(self):
+        return self.target + PART_SUFFIX
+
+    @property
+    def meta_path(self):
+        return self.target + META_SUFFIX
+
+    @property
+    def tmpdir(self):
+        """FTP / HLS 用：独立的临时目录。"""
+        return self.target + ".dltmp"
+
+    def to_dict(self):
+        return {
+            "id": self.id, "url": self.url, "final_url": self.final_url,
+            "target": self.target, "headers": self.headers, "ua": self.ua,
+            "max_conn": self.max_conn, "filename_hint": self.filename_hint,
+            "size": self.size, "etag": self.etag, "last_modified": self.last_modified,
+            "content_type": self.content_type, "supports_range": self.supports_range,
+            "state": self.state, "created": self.created, "finished": self.finished,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        t = cls(d["url"], d["target"], headers=d.get("headers") or {},
+                ua=d.get("ua"), max_conn=d.get("max_conn", 8),
+                task_id=d.get("id"), filename_hint=d.get("filename_hint"))
+        t.final_url = d.get("final_url")
+        t.size = d.get("size", 0)
+        t.etag = d.get("etag")
+        t.last_modified = d.get("last_modified")
+        t.content_type = d.get("content_type")
+        t.supports_range = d.get("supports_range", False)
+        t.state = d.get("state", "paused")
+        if t.state in ("running", "probing", "queued"):
+            t.state = "paused"
+        t.created = d.get("created", time.time())
+        t.finished = d.get("finished")
+        t._load_meta()
+        return t
+
+    # ---------- 分块状态旁车 ----------
+    def _save_meta(self):
+        try:
+            with open(self.meta_path, "w", encoding="utf-8") as f:
+                json.dump({"url": self.url, "size": self.size, "etag": self.etag,
+                           "lm": self.last_modified,
+                           "chunks": [c.d() for c in self.chunks]}, f)
+        except Exception:
+            pass
+
+    def _load_meta(self):
+        try:
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("url") != self.url:
+                return False
+            self.size = d.get("size") or 0
+            self.etag = d.get("etag")
+            self.last_modified = d.get("lm")
+            self.chunks = [Chunk.load(a) for a in d.get("chunks") or []]
+            return bool(self.chunks) and os.path.exists(self.part_path)
+        except Exception:
+            return False
+
+    def _drop_progress(self):
+        self.chunks = []
+        self.downloaded = 0
+        for p in (self.part_path, self.meta_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    # ---------- 探测 ----------
+    def probe(self):
+        self.state = "probing"
+        url = self.url
+        for _ in range(8):
+            u = up.urlsplit(url)
+            if u.scheme == "ftp":
+                raise IOError("FTP")
+            host = u.hostname
+            port = u.port or (443 if u.scheme == "https" else 80)
+            path = (u.path or "/") + (("?" + u.query) if u.query else "")
+            if u.scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    host, port, timeout=20, context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=20)
+            h = dict(self.headers)
+            h.setdefault("User-Agent", self.ua or DEFAULT_UA)
+            h["Accept-Encoding"] = "identity"
+            h["Range"] = "bytes=0-0"
+            conn.request("GET", path, headers=h)
+            resp = conn.getresponse()
+
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                conn.close()
+                if not loc:
+                    raise IOError("redirect without Location")
+                url = up.urljoin(url, loc)
+                continue
+
+            self.final_url = url
+            self.content_type = resp.getheader("Content-Type")
+            self.etag = resp.getheader("ETag")
+            self.last_modified = resp.getheader("Last-Modified")
+
+            if resp.status == 206:
+                m = re.search(r"/(\d+)", resp.getheader("Content-Range") or "")
+                if not m:
+                    raise IOError("bad Content-Range")
+                self.size = int(m.group(1))
+                self.supports_range = True
+            elif resp.status == 200:
+                cl = resp.getheader("Content-Length")
+                self.size = int(cl) if cl else 0
+                self.supports_range = False
+            else:
+                conn.close()
+                raise IOError(f"HTTP {resp.status} {resp.reason}")
+            conn.close()
+            return
+        raise IOError("too many redirects")
+
+    def guess_name(self):
+        if self.filename_hint:
+            return self.filename_hint
+        u = up.urlsplit(self.final_url or self.url)
+        name = os.path.basename(up.unquote(u.path)) or "download.bin"
+        return re.sub(r'[\\/:*?"<>|]', "_", name)[:150]
+
+    # ---------- 主流程 ----------
+    def run(self, limiter: SpeedLimiter, on_change):
+        try:
+            scheme = up.urlsplit(self.url).scheme.lower()
+            if scheme == "ftp":
+                from .ftpdl import ftp_download
+                return ftp_download(self, limiter, on_change)
+            from .hls import is_hls, hls_download
+            if is_hls(self.url):
+                return hls_download(self, limiter, on_change)
+
+            resumed = self._load_meta()
+            if not resumed:
+                self.probe()
+                self._drop_progress()          # 清掉旧进度（会清空 chunks）
+                os.makedirs(os.path.dirname(os.path.abspath(self.target)) or ".", exist_ok=True)
+                # 预分配目标大小（稀疏），后续各连接直接定位写
+                with open(self.part_path, "wb") as f:
+                    if self.size:
+                        f.truncate(self.size)
+                self.chunks = self._initial_chunks()
+
+            if not os.path.basename(self.target):
+                self.target = os.path.join(os.path.dirname(self.target), self.guess_name())
+
+            self.state = "running"
+            self.message = "下载中"
+            self._t0 = time.monotonic()
+            self._bytes = 0
+            self.downloaded = sum(c.pos - c.start for c in self.chunks)
+            self._save_meta()
+            on_change(self)
+
+            self._runner = True
+            try:
+                errs = self._dispatch(limiter, on_change)
+            finally:
+                self._runner = False
+
+            if all(c.done for c in self.chunks):
+                self._finalize()
+            elif self.stop.is_set():
+                self.state = "canceled"
+                self.message = "已取消"
+            elif self.pause.is_set():
+                self.state = "paused"
+                self.message = "已暂停"
+            elif any(e == "no-range" for e in errs):
+                self.state = "error"
+                self.message = "服务器不支持分段下载"
+            else:
+                self.state = "error"
+                self.message = errs[0] if errs else "下载未完成"
+        except Aborted:
+            self.state = "canceled" if self.stop.is_set() else "paused"
+            self.message = "已取消" if self.stop.is_set() else "已暂停"
+        except Exception as e:
+            self.state = "error"
+            self.message = f"{type(e).__name__}: {e}"
+        finally:
+            self._runner = False
+            self.speed = 0.0
+            try:
+                if self.chunks and not all(c.done for c in self.chunks):
+                    self._save_meta()
+            except Exception:
+                pass
+            on_change(self)
+
+    def _finalize(self):
+        self.message = "正在校验..."
+        self.speed = 0.0
+        # 无合并步骤：part 已经是完整文件，直接改名
+        if os.path.exists(self.target):
+            try:
+                os.remove(self.target)
+            except Exception:
+                pass
+        os.replace(self.part_path, self.target)
+        try:
+            os.remove(self.meta_path)
+        except Exception:
+            pass
+        self.state = "done"
+        self.finished = time.time()
+        self.message = "已完成"
+        self.downloaded = self.size or self.downloaded
+
+    def _dispatch(self, limiter, on_change):
+        errors: list[str] = []
+
+        for attempt in range(3):
+            pending = [c for c in self.chunks if not c.done and c.remaining > 0]
+            if not pending or self.stop.is_set() or self.pause.is_set():
+                break
+
+            workers, self._conns = [], []
+
+            def spawn(chunk):
+                c = Conn(self, chunk)
+                self._conns.append(c)
+
+                def body():
+                    try:
+                        c.run(self.stop, self.pause, limiter, self._add)
+                    except Aborted:
+                        pass
+                    except NoRangeError:
+                        chunk.error = "no-range"
+                        errors.append("no-range")
+                    except Exception as e:
+                        chunk.error = f"{type(e).__name__}: {e}"
+                        errors.append(chunk.error)
+
+                th = threading.Thread(target=body, daemon=True)
+                th.start()
+                workers.append(th)
+
+            pending.sort(key=lambda c: -c.remaining)
+            for c in pending[:self.max_conn]:
+                spawn(c)
+
+            while True:
+                if self.stop.is_set() or self.pause.is_set():
+                    break
+                if not any(w.is_alive() for w in workers):
+                    break
+
+                if (self.supports_range and not errors
+                        and len(self._conns) < self.max_conn
+                        and self.size >= MIN_CHUNK * 2):
+                    slow = max(self._conns, key=lambda c: c.eta(), default=None)
+                    free = self._max_free()
+                    if (slow and free and free.size >= MIN_CHUNK * 2
+                            and slow.eta() > (len(self._conns) + 1) * HANDSHAKE_COST * 2):
+                        tail = self._split(free)
+                        if tail:
+                            spawn(tail)
+
+                self._speed()
+                on_change(self)
+                time.sleep(GROW_POLL)
+
+            for w in workers:
+                w.join(timeout=30)
+
+            self._save_meta()
+            if all(c.done for c in self.chunks):
+                break
+            if self.stop.is_set() or self.pause.is_set() or "no-range" in errors:
+                break
+            time.sleep(0.6 * (attempt + 1))
+
+        if ("no-range" in errors and not self.stop.is_set() and not self.pause.is_set()
+                and not all(c.done for c in self.chunks)):
+            if not self._fallback_single(limiter, on_change):
+                errors.append("降级单连接失败")
+        return errors
+
+    def _fallback_single(self, limiter, on_change):
+        self.supports_range = False
+        self._drop_progress()
+        os.makedirs(os.path.dirname(os.path.abspath(self.target)) or ".", exist_ok=True)
+        with open(self.part_path, "wb") as f:
+            if self.size:
+                f.truncate(self.size)
+        self.chunks = [Chunk(0, 0, max(self.size - 1, 0))]
+        self.downloaded = 0
+        self._bytes = 0
+        c = Conn(self, self.chunks[0])
+        self._conns = [c]
+        try:
+            c.run(self.stop, self.pause, limiter, self._add)
+        except Exception as e:
+            self.chunks[0].error = str(e)
+        self._speed()
+        on_change(self)
+        return self.chunks[0].done
+
+    # 每条连接负责的字节量：太小则握手开销占比过高，4MB 是经验值
+    BYTES_PER_CONN = 4 * MIN_CHUNK
+
+    def _initial_chunks(self):
+        """按文件大小一次性切成 n 段（大文件直接铺满连接数）。"""
+        if self.size <= 0:
+            return [Chunk(0, 0, 0)]
+        if not self.supports_range:
+            return [Chunk(0, 0, self.size - 1)]
+        n = max(1, min(self.max_conn, self.size // self.BYTES_PER_CONN))
+        if n <= 1:
+            return [Chunk(0, 0, self.size - 1)]
+        step = self.size // n
+        out = []
+        for i in range(n):
+            a = i * step
+            b = (self.size - 1) if i == n - 1 else (a + step - 1)
+            out.append(Chunk(i, a, b))
+        return out
+
+    def _max_free(self):
+        best = None
+        for c in self.chunks:
+            if c.done:
+                continue
+            if best is None or c.remaining > best.remaining:
+                best = c
+        return best if best and best.remaining > 0 else None
+
+    def _split(self, c):
+        rem = c.remaining
+        if rem < MIN_CHUNK * 2:
+            return None
+        mid = c.pos + rem // 2
+        new = Chunk(len(self.chunks), mid, c.end)
+        c.end = mid - 1
+        self.chunks.append(new)
+        return new
+
+    def _add(self, n):
+        with self._lock:
+            self._bytes += n
+            self.downloaded += n
+
+    def _speed(self):
+        el = max(0.001, time.monotonic() - (self._t0 or time.monotonic()))
+        self.speed = self._bytes / el
+
+    # ---------- 控制 ----------
+    def pause_task(self):
+        self.pause.set()
+        if self.state in ("running", "probing"):
+            self.state = "paused"
+            self.message = "已暂停"
+
+    def resume_task(self):
+        self.pause.clear()
+        if self.state == "paused":
+            self.state = "running"
+            self.message = "下载中"
+
+    def cancel(self):
+        self.stop.set()
+        self.pause.clear()
+
+    def snapshot(self):
+        total = self.size or 0
+        done = sum((c.size if c.done else max(0, c.pos - c.start)) for c in self.chunks)
+        if total <= 0:
+            total = sum(c.size for c in self.chunks)
+        if self.state == "done" and total > 0:
+            done = total          # 已完成任务重启后分块旁车可能已清，按 100% 显示
+        known = 0 < total < (1 << 50)
+        pct = round(min(100.0, done / total * 100.0), 2) if known else None
+        return {
+            "id": self.id, "url": self.url, "target": self.target,
+            "name": os.path.basename(self.target or ""),
+            "state": self.state, "message": self.message,
+            "size": total if known else 0, "downloaded": done, "percent": pct,
+            "speed": round(self.speed, 1),
+            "connections": len([c for c in self.chunks if not c.done]),
+            "max_conn": self.max_conn,
+            "content_type": self.content_type,
+            "supports_range": self.supports_range,
+            "created": self.created, "finished": self.finished,
+        }

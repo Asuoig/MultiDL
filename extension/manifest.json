@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "MultiDL 集成",
+  "version": "1.0.1",
+  "description": "把浏览器下载接管给本地 MultiDL（多线程分段下载器）",
+  "permissions": ["downloads", "contextMenus", "storage", "activeTab", "notifications"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "MultiDL",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

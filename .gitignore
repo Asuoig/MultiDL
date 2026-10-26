@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 构建产物 ----
+build/
+dist/
+*.spec.bak
+
+# ---- 密钥 / 私有（绝不提交）----
+*.pem
+*.crx
+
+# ---- 运行数据 ----
+*.dlpart
+*.dlmeta
+*.dltmp
+*.part
+*.tmp
+
+# ---- 内部资料（不上传）----
+_internal/
+
+# ---- 系统 ----
+Thumbs.db
+.DS_Store
+desktop.ini
