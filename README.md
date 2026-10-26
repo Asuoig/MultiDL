@@ -110,6 +110,7 @@ python test/bench.py
 - ✅ 浏览器接管（可选扩展）
 - ✅ 系统托盘常驻（关闭窗口缩到右下角，托盘菜单可暂停 / 继续 / 退出）
 - ✅ 代理支持（默认读 Windows 系统代理，Clash 等自动生效；可 `--proxy` 指定；本地地址直连）
+- ✅ 反反爬兜底：引擎失败（403 / 空响应 / 被拦）时，自动用 curl_cffi（Chrome TLS 指纹）再试一次（先代理、后直连）；仍不通才判「被墙」
 
 ---
 
@@ -161,6 +162,7 @@ python main.py
 
 ```bat
 python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt   :: 可选：curl_cffi 反反爬兜底
 .venv\Scripts\pip install pyinstaller
 .venv\Scripts\python -m PyInstaller --noconfirm --onefile --windowed ^
     --name MultiDL --icon assets/icon.ico ^

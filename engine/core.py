@@ -517,14 +517,22 @@ class Task:
                 self.state = "error"
                 self.message = "服务器不支持分段下载"
             else:
+                if not self.stop.is_set() and self._try_fallback(on_change):
+                    return
                 self.state = "error"
-                self.message = errs[0] if errs else "下载未完成"
+                self.message = self._final_error(errs[0] if errs else "下载未完成")
         except Aborted:
             self.state = "canceled" if self.stop.is_set() else "paused"
             self.message = "已取消" if self.stop.is_set() else "已暂停"
         except Exception as e:
-            self.state = "error"
-            self.message = f"{type(e).__name__}: {e}"
+            if self.stop.is_set():
+                self.state = "canceled"
+                self.message = "已取消"
+            elif self._try_fallback(on_change):
+                return
+            else:
+                self.state = "error"
+                self.message = self._final_error(f"{type(e).__name__}: {e}")
         finally:
             self._runner = False
             self.speed = 0.0
@@ -534,6 +542,37 @@ class Task:
             except Exception:
                 pass
             on_change(self)
+
+    def _try_fallback(self, on_change):
+        """原生引擎失败时，尝试 curl_cffi（Chrome 指纹）兜底；没装则跳过。"""
+        try:
+            from .fallback import curl_cffi_download
+            import curl_cffi
+            try:
+                import diag
+                diag.get_logger().info("curl_cffi 可用 %s，尝试兜底", getattr(curl_cffi, "__version__", "?"))
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                import diag
+                diag.get_logger().warning("curl_cffi 不可用，跳过兜底：%s", e)
+            except Exception:
+                pass
+            return False
+        try:
+            return curl_cffi_download(self, on_change)
+        except Exception:
+            return False
+
+    def _final_error(self, err):
+        low = (err or "").lower()
+        netish = any(k in low for k in (
+            "403", "407", "连接失败", "空响应", "timed out", "timeout", "eof",
+            "reset", "ssl", "urlopen", "10060", "10054", "connection", "aborted"))
+        if netish:
+            return "被墙（代理 / 直连 / 浏览器指纹均无法访问，可能被网络或站点拦截）"
+        return err
 
     def _finalize(self):
         self.message = "正在校验..."
