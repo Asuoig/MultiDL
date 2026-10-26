@@ -167,6 +167,11 @@ class Conn:
                 conn = _make_conn(u.scheme, host, port, 25, allow_proxy=use_proxy)
                 conn.request("GET", path, headers=h)
                 resp = conn.getresponse()
+                # 代理返回 403/407/502/503 → 多半是代理 IP 被目标站拦（如国内镜像），换直连重试
+                if use_proxy and resp.status in (403, 407, 502, 503) and i < len(attempts) - 1:
+                    conn.close()
+                    conn = resp = None
+                    continue
                 break
             except Exception:
                 try:
@@ -176,6 +181,8 @@ class Conn:
                 conn = resp = None
                 if i == len(attempts) - 1:
                     raise
+        if resp is None:
+            raise IOError("连接失败")
         self.conn = conn
         self.resp = resp
 
@@ -397,6 +404,10 @@ class Task:
                     conn = _make_conn(u.scheme, host, port, 20, allow_proxy=use_proxy)
                     conn.request("GET", path, headers=h)
                     resp = conn.getresponse()
+                    if use_proxy and resp.status in (403, 407, 502, 503) and i < len(attempts) - 1:
+                        conn.close()
+                        conn = resp = None
+                        continue
                     break
                 except Exception:
                     try:
@@ -406,6 +417,8 @@ class Task:
                     conn = resp = None
                     if i == len(attempts) - 1:
                         raise
+            if resp is None:
+                raise IOError("连接失败")
 
             if resp.status in (301, 302, 303, 307, 308):
                 loc = resp.getheader("Location")
@@ -428,7 +441,14 @@ class Task:
                 self.supports_range = True
             elif resp.status == 200:
                 cl = resp.getheader("Content-Length")
-                self.size = int(cl) if cl else 0
+                te = (resp.getheader("Transfer-Encoding") or "").lower()
+                if cl:
+                    self.size = int(cl)
+                elif "chunked" in te:
+                    self.size = 0              # 长度未知，流式单连接下载
+                else:
+                    conn.close()
+                    raise IOError("服务器返回空响应（无 Content-Length），文件可能不存在或被镜像拦截")
                 self.supports_range = False
             else:
                 conn.close()
