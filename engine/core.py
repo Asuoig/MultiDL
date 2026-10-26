@@ -21,6 +21,27 @@ import threading
 import http.client
 import urllib.parse as up
 
+from .proxy import proxy_for
+
+
+def _make_conn(scheme, host, port, timeout):
+    """按代理配置创建连接；有代理则走 CONNECT 隧道（HTTPS/HTTP 都支持）。"""
+    px = proxy_for(host)
+    if px:
+        ph, pp = px
+        if scheme == "https":
+            c = http.client.HTTPSConnection(ph, pp, timeout=timeout,
+                                            context=ssl.create_default_context())
+        else:
+            c = http.client.HTTPConnection(ph, pp, timeout=timeout)
+        c.set_tunnel(host, port)
+        return c
+    if scheme == "https":
+        return http.client.HTTPSConnection(host, port, timeout=timeout,
+                                           context=ssl.create_default_context())
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -127,12 +148,7 @@ class Conn:
         port = u.port or (443 if u.scheme == "https" else 80)
         path = (u.path or "/") + (("?" + u.query) if u.query else "")
 
-        if u.scheme == "https":
-            conn = http.client.HTTPSConnection(
-                host, port, timeout=25,
-                context=ssl.create_default_context())
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=25)
+        conn = _make_conn(u.scheme, host, port, 25)
 
         h = dict(t.headers)
         h.setdefault("User-Agent", t.ua or DEFAULT_UA)
@@ -227,7 +243,11 @@ class Task:
             self.headers.setdefault("Referer", referer)
         if cookie:
             self.headers.setdefault("Cookie", cookie)
-        self.max_conn = max(1, min(int(max_conn), MAX_CONN_HARD))
+        # max_conn: None / 0 / "auto" 表示按文件大小自动决定（4MB/连接，上限 32）
+        if max_conn in (None, 0, "auto", "自动"):
+            self.max_conn = None
+        else:
+            self.max_conn = max(1, min(int(max_conn), MAX_CONN_HARD))
         self.filename_hint = filename_hint
 
         self.size = 0
@@ -340,11 +360,7 @@ class Task:
             host = u.hostname
             port = u.port or (443 if u.scheme == "https" else 80)
             path = (u.path or "/") + (("?" + u.query) if u.query else "")
-            if u.scheme == "https":
-                conn = http.client.HTTPSConnection(
-                    host, port, timeout=20, context=ssl.create_default_context())
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=20)
+            conn = _make_conn(u.scheme, host, port, 20)
             h = dict(self.headers)
             h.setdefault("User-Agent", self.ua or DEFAULT_UA)
             h["Accept-Encoding"] = "identity"
@@ -409,11 +425,13 @@ class Task:
                 with open(self.part_path, "wb") as f:
                     if self.size:
                         f.truncate(self.size)
+                self._resolve_auto_conn()
                 self.chunks = self._initial_chunks()
 
             if not os.path.basename(self.target):
                 self.target = os.path.join(os.path.dirname(self.target), self.guess_name())
 
+            self._resolve_auto_conn()          # 续传路径：确保 max_conn 已确定
             self.state = "running"
             self.message = "下载中"
             self._t0 = time.monotonic()
@@ -571,6 +589,12 @@ class Task:
     # 每条连接负责的字节量：太小则握手开销占比过高，4MB 是经验值
     BYTES_PER_CONN = 4 * MIN_CHUNK
 
+    def _resolve_auto_conn(self):
+        """max_conn 为 None（自动）时按文件大小定：4MB/连接，1~32。"""
+        if self.max_conn is None:
+            n = (self.size // self.BYTES_PER_CONN) if self.size else 0
+            self.max_conn = max(1, min(MAX_CONN_HARD, n or 1))
+
     def _initial_chunks(self):
         """按文件大小一次性切成 n 段（大文件直接铺满连接数）。"""
         if self.size <= 0:
@@ -649,7 +673,7 @@ class Task:
             "size": total if known else 0, "downloaded": done, "percent": pct,
             "speed": round(self.speed, 1),
             "connections": len([c for c in self.chunks if not c.done]),
-            "max_conn": self.max_conn,
+            "max_conn": self.max_conn or 0,
             "content_type": self.content_type,
             "supports_range": self.supports_range,
             "created": self.created, "finished": self.finished,

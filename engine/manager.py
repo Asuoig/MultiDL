@@ -29,9 +29,28 @@ def unique_path(path: str) -> str:
         i += 1
 
 
+def _norm_conn(v) -> int:
+    """0 / auto / None → 0（自动）；否则夹到 1~32。"""
+    if v is None:
+        return 0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("", "auto", "自动", "none"):
+            return 0
+        try:
+            v = int(s)
+        except ValueError:
+            return 0
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 0
+    return 0 if n <= 0 else max(1, min(n, 32))
+
+
 class Manager:
     def __init__(self, data_dir: str, download_dir: str, max_parallel: int = 3,
-                 speed_limit: int = 0, default_conn: int = 8):
+                 speed_limit: int = 0, default_conn: int = 0):
         self.data_dir = os.path.abspath(data_dir)
         self.download_dir = os.path.abspath(download_dir)
         os.makedirs(self.data_dir, exist_ok=True)
@@ -39,7 +58,7 @@ class Manager:
         self.state_file = os.path.join(self.data_dir, "tasks.json")
         self.limiter = SpeedLimiter(speed_limit)
         self.max_parallel = max(1, int(max_parallel))
-        self.default_conn = max(1, min(int(default_conn), 32))
+        self.default_conn = _norm_conn(default_conn)
         self.tasks: dict[str, Task] = {}
         self.order: list[str] = []
         self._lock = threading.RLock()
@@ -66,7 +85,7 @@ class Manager:
                     self.download_dir = d
                     os.makedirs(d, exist_ok=True)
             self.max_parallel = max(1, int(c.get("max_parallel", self.max_parallel)))
-            self.default_conn = max(1, min(int(c.get("default_conn", self.default_conn)), 32))
+            self.default_conn = _norm_conn(c.get("default_conn", self.default_conn))
             self.limiter.set_bps(int(c.get("speed_limit", 0)))
             self._sem = threading.Semaphore(self.max_parallel)
         except Exception:
@@ -162,7 +181,7 @@ class Manager:
 
         t = Task(url, target, headers=headers or {}, ua=ua or DEFAULT_UA,
                  referer=referer, cookie=cookie,
-                 max_conn=max_conn or self.default_conn,
+                 max_conn=max_conn if max_conn is not None else self.default_conn,
                  filename_hint=filename_hint)
         with self._lock:
             self.tasks[t.id] = t
@@ -268,7 +287,7 @@ class Manager:
         if speed_limit is not None:
             self.limiter.set_bps(int(speed_limit))
         if default_conn is not None:
-            self.default_conn = max(1, min(int(default_conn), 32))
+            self.default_conn = _norm_conn(default_conn)
         self._dirty = True
         self._save_config()
         return self.settings()

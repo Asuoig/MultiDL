@@ -13,6 +13,21 @@ from tkinter import ttk, filedialog, messagebox
 APP = "MultiDL"
 APP_TITLE = "MultiDL 下载器"
 
+CONN_CHOICES = ["自动", "2", "4", "8", "12", "16", "24", "32"]
+
+
+def _conn_to_label(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return "自动"
+    return "自动" if v <= 0 else str(v)
+
+
+def _label_to_conn(s):
+    s = str(s).strip()
+    return 0 if s in ("自动", "", "auto") else int(s)
+
 STATE_TXT = {
     "queued": "排队中", "probing": "探测中", "running": "下载中",
     "paused": "已暂停", "done": "已完成", "error": "出错", "canceled": "已取消",
@@ -117,9 +132,9 @@ class AddDialog(Dialog):
         row2 = ttk.Frame(self)
         row2.pack(fill="x", padx=14, pady=(8, 0))
         ttk.Label(row2, text="连接数").pack(side="left")
-        self.conn = tk.IntVar(value=defaults["default_conn"])
-        ttk.Spinbox(row2, from_=1, to=32, textvariable=self.conn,
-                    width=5).pack(side="left", padx=(6, 18))
+        self.conn = tk.StringVar(value=_conn_to_label(defaults["default_conn"]))
+        ttk.Combobox(row2, values=CONN_CHOICES, textvariable=self.conn,
+                     width=5, state="readonly").pack(side="left", padx=(6, 18))
         ttk.Label(row2, text="Referer（防盗链必填）").pack(side="left")
         self.ref = tk.StringVar()
         ttk.Entry(row2, textvariable=self.ref).pack(side="left", fill="x",
@@ -146,7 +161,7 @@ class AddDialog(Dialog):
         self.result = {
             "urls": urls,
             "dir": self.dir.get().strip(),
-            "conn": int(self.conn.get() or 8),
+            "conn": _label_to_conn(self.conn.get()),
             "referer": self.ref.get().strip() or None,
             "autostart": bool(self.autostart.get()),
         }
@@ -173,9 +188,9 @@ class OptionsDialog(Dialog):
             row=0, column=1, sticky="w", padx=10)
 
         ttk.Label(grid, text="每任务默认连接数").grid(row=1, column=0, sticky="w", pady=5)
-        self.conn = tk.IntVar(value=settings["default_conn"])
-        ttk.Spinbox(grid, from_=1, to=32, textvariable=self.conn, width=6).grid(
-            row=1, column=1, sticky="w", padx=10)
+        self.conn = tk.StringVar(value=_conn_to_label(settings["default_conn"]))
+        ttk.Combobox(grid, values=CONN_CHOICES, textvariable=self.conn,
+                     width=6, state="readonly").grid(row=1, column=1, sticky="w", padx=10)
 
         ttk.Label(grid, text="全局限速（KB/s，0=不限）").grid(row=2, column=0, sticky="w", pady=5)
         self.spd = tk.IntVar(value=int(settings["speed_limit"] // 1024))
@@ -198,7 +213,7 @@ class OptionsDialog(Dialog):
         self.result = {
             "download_dir": self.dir.get().strip(),
             "max_parallel": int(self.par.get() or 3),
-            "default_conn": int(self.conn.get() or 8),
+            "default_conn": _label_to_conn(self.conn.get()),
             "speed_limit": int(self.spd.get() or 0) * 1024,
             "clipboard_watch": bool(self.clip.get()),
         }
@@ -484,7 +499,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.2\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.3\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -564,7 +579,7 @@ class App(tk.Tk):
                 else bar_text(None),
                 human_speed(s["speed"]),
                 eta_text(remain, s["speed"]) if s["state"] == "running" else "-",
-                f'{s["connections"]}/{s["max_conn"]}',
+                f'{s["connections"]}/{s["max_conn"]}' if s["max_conn"] else "自动",
                 STATE_TXT.get(s["state"], s["state"]),
                 s["url"],
             )
