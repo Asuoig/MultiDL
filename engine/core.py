@@ -24,9 +24,9 @@ import urllib.parse as up
 from .proxy import proxy_for
 
 
-def _make_conn(scheme, host, port, timeout):
+def _make_conn(scheme, host, port, timeout, allow_proxy=True):
     """按代理配置创建连接；有代理则走 CONNECT 隧道（HTTPS/HTTP 都支持）。"""
-    px = proxy_for(host)
+    px = proxy_for(host) if allow_proxy else None
     if px:
         ph, pp = px
         if scheme == "https":
@@ -148,8 +148,6 @@ class Conn:
         port = u.port or (443 if u.scheme == "https" else 80)
         path = (u.path or "/") + (("?" + u.query) if u.query else "")
 
-        conn = _make_conn(u.scheme, host, port, 25)
-
         h = dict(t.headers)
         h.setdefault("User-Agent", t.ua or DEFAULT_UA)
         h["Accept-Encoding"] = "identity"
@@ -161,8 +159,23 @@ class Conn:
             elif t.last_modified:
                 h["If-Range"] = t.last_modified
 
-        conn.request("GET", path, headers=h)
-        resp = conn.getresponse()
+        # 先按代理连；代理失败则退回直连（保证不会因为代理配错而让下载失败）
+        attempts = (True, False) if proxy_for(host) else (False,)
+        conn = resp = None
+        for i, use_proxy in enumerate(attempts):
+            try:
+                conn = _make_conn(u.scheme, host, port, 25, allow_proxy=use_proxy)
+                conn.request("GET", path, headers=h)
+                resp = conn.getresponse()
+                break
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = resp = None
+                if i == len(attempts) - 1:
+                    raise
         self.conn = conn
         self.resp = resp
 
@@ -360,13 +373,26 @@ class Task:
             host = u.hostname
             port = u.port or (443 if u.scheme == "https" else 80)
             path = (u.path or "/") + (("?" + u.query) if u.query else "")
-            conn = _make_conn(u.scheme, host, port, 20)
             h = dict(self.headers)
             h.setdefault("User-Agent", self.ua or DEFAULT_UA)
             h["Accept-Encoding"] = "identity"
             h["Range"] = "bytes=0-0"
-            conn.request("GET", path, headers=h)
-            resp = conn.getresponse()
+            attempts = (True, False) if proxy_for(host) else (False,)
+            conn = resp = None
+            for i, use_proxy in enumerate(attempts):
+                try:
+                    conn = _make_conn(u.scheme, host, port, 20, allow_proxy=use_proxy)
+                    conn.request("GET", path, headers=h)
+                    resp = conn.getresponse()
+                    break
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = resp = None
+                    if i == len(attempts) - 1:
+                        raise
 
             if resp.status in (301, 302, 303, 307, 308):
                 loc = resp.getheader("Location")
