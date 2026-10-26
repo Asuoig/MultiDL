@@ -53,8 +53,15 @@ def _one(task, creq, proxies, on_change) -> bool:
     task.speed = 0.0
     on_change(task)
 
+    # 只透传防盗链需要的 Referer / Cookie；绝不动 User-Agent（会覆盖指纹伪装，导致 403）
+    hdrs = {}
+    if task.headers:
+        for k in ("Referer", "Cookie"):
+            v = task.headers.get(k)
+            if v:
+                hdrs[k] = v
     r = creq.get(url, impersonate="chrome", proxies=proxies, stream=True, timeout=30,
-                 headers={"User-Agent": task.ua or "Mozilla/5.0"})
+                 headers=hdrs or None)
     try:
         if r.status_code not in (200, 206):
             return False
