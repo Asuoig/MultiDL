@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=3)
     ap.add_argument("--speed", type=int, default=0, help="KB/s，0=不限")
     ap.add_argument("--port", type=int, default=8765, help="浏览器扩展端口，0=关闭")
+    ap.add_argument("--tray", action="store_true", help="启动后驻留系统托盘，不弹出主窗口")
     ap.add_argument("url", nargs="?", default=None)
     a = ap.parse_args()
     log.info("启动参数: dir=%s data=%s conn=%s parallel=%s speed=%s port=%s url=%s",
@@ -69,6 +70,8 @@ def main():
 
     app = App(mgr, api_port)
     diag.install(app)                # 接管 tkinter 界面回调里的异常
+    if a.tray:
+        app.withdraw()               # 只驻留托盘，不弹主窗口
     app.mainloop()
 
 

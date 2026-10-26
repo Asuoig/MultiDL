@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import queue
 import webbrowser
 import subprocess
 import tkinter as tk
@@ -212,6 +213,7 @@ class App(tk.Tk):
         self._clip_last = ""
         self._sort = ("created", True)
         self._last_total_speed = 0.0
+        self._tray = None
 
         self.title(APP_TITLE)
         self.geometry("1080x640")
@@ -231,6 +233,7 @@ class App(tk.Tk):
         self.after(300, self._tick)
         self.after(900, self._clip_watch)
         self._set_icon()
+        self._init_tray()
 
     # ---------------- 外观 ----------------
     def _init_style(self):
@@ -481,7 +484,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.1\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.2\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -587,11 +590,73 @@ class App(tk.Tk):
         self.st_right.config(text=f"总速度  {human_speed(total_speed)}")
         self.title(f"{APP_TITLE}  —  {human_speed(total_speed)}" if total_speed
                    else APP_TITLE)
+        if self._tray:
+            try:
+                self._tray.set_tooltip(f"MultiDL — {human_speed(total_speed)}" if total_speed
+                                       else "MultiDL")
+            except Exception:
+                pass
+
+    # ---------------- 系统托盘 ----------------
+    def _init_tray(self):
+        try:
+            from tray import Tray
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            icon = os.path.join(base, "assets", "icon.ico")
+            self._tray = Tray(icon, "MultiDL", menu=[
+                ("显示主窗口", "show"),
+                ("暂停全部", "pause_all"),
+                ("继续全部", "start_all"),
+                (None, None),
+                ("退出", "quit"),
+            ])
+            self._tray.start()
+            self.after(200, self._poll_tray)
+        except Exception:
+            self._tray = None
+
+    def _poll_tray(self):
+        if self._tray:
+            try:
+                while True:
+                    self._handle_tray(self._tray.actions.get_nowait())
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+        self.after(250, self._poll_tray)
+
+    def _handle_tray(self, act):
+        if act == "show":
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        elif act == "pause_all":
+            self.mgr.pause_all()
+        elif act == "start_all":
+            self.mgr.start_all()
+        elif act == "quit":
+            self._really_quit()
 
     def on_close(self):
+        # 有托盘 → 关闭窗口只是隐藏到托盘，程序继续在后台跑；真正退出用托盘菜单「退出」
+        if self._tray:
+            try:
+                self.mgr.save_now()
+            except Exception:
+                pass
+            self.withdraw()
+            return
+        self._really_quit()
+
+    def _really_quit(self):
         try:
             self.mgr.save_now()
-            time.sleep(0.05)
+        except Exception:
+            pass
+        try:
+            if self._tray:
+                self._tray.stop()
         except Exception:
             pass
         self.destroy()
