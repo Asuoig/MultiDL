@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MultiDL 集成",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "把浏览器下载接管给本地 MultiDL（多线程分段下载器）",
   "permissions": ["downloads", "contextMenus", "storage", "activeTab", "notifications"],
   "host_permissions": ["http://127.0.0.1/*"],

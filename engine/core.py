@@ -365,6 +365,19 @@ class Task:
     # ---------- 探测 ----------
     def probe(self):
         self.state = "probing"
+        last = None
+        for attempt in range(3):
+            try:
+                return self._probe_once()
+            except Exception as e:
+                if str(e) in ("FTP", "redirect without Location", "bad Content-Range"):
+                    raise
+                last = e
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        raise last
+
+    def _probe_once(self):
         url = self.url
         for _ in range(8):
             u = up.urlsplit(url)
@@ -616,10 +629,10 @@ class Task:
     BYTES_PER_CONN = 4 * MIN_CHUNK
 
     def _resolve_auto_conn(self):
-        """max_conn 为 None（自动）时按文件大小定：4MB/连接，1~32。"""
+        """自动连接数：至少 8 条（IDM 默认也是 8），大文件最多 16 条。"""
         if self.max_conn is None:
-            n = (self.size // self.BYTES_PER_CONN) if self.size else 0
-            self.max_conn = max(1, min(MAX_CONN_HARD, n or 1))
+            n = (self.size // (8 * MIN_CHUNK)) if self.size else 0
+            self.max_conn = min(16, max(8, n))
 
     def _initial_chunks(self):
         """按文件大小一次性切成 n 段（大文件直接铺满连接数）。"""
