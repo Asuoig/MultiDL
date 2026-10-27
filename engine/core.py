@@ -781,6 +781,8 @@ class Task:
         done = sum((c.size if c.done else max(0, c.pos - c.start)) for c in self.chunks)
         if total <= 0:
             total = sum(c.size for c in self.chunks)
+        # 兜底下载（curl_cffi）不走 chunks，只累加 self.downloaded，取两者较大值
+        done = max(done, self.downloaded or 0)
         if self.state == "done" and total > 0:
             done = total          # 已完成任务重启后分块旁车可能已清，按 100% 显示
         known = 0 < total < (1 << 50)

@@ -8,6 +8,7 @@ import queue
 import webbrowser
 import subprocess
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, filedialog, messagebox
 
 APP = "MultiDL"
@@ -74,6 +75,31 @@ def bar_text(pct, width=10):
     pct = max(0.0, min(100.0, pct))
     k = int(round(pct / 100.0 * width))
     return BAR_FULL * k + BAR_EMPTY * (width - k)
+
+
+# ---- 速度可视化（Unicode 块字符 sparkline，纯 tkinter 可用） ----
+SPARK_CHARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"   # ▁▂▃▄▅▆▇█
+SPARK_WIDTH = 14
+
+
+def sparkline(hist, width=SPARK_WIDTH):
+    """把速度历史画成柱状曲线：高度按窗口内峰值归一化。"""
+    if not hist:
+        return ""
+    data = list(hist)[-width:]
+    if len(data) < width:                      # 右侧对齐，左边补空
+        data = [None] * (width - len(data)) + data
+    mx = max([v for v in data if v] or [0.0])
+    if mx <= 0:
+        return ""
+    out = []
+    for v in data:
+        if not v:
+            out.append(" ")
+        else:
+            k = int(round((v / mx) * (len(SPARK_CHARS) - 1)))
+            out.append(SPARK_CHARS[max(0, min(len(SPARK_CHARS) - 1, k))])
+    return "".join(out)
 
 
 class Dialog(tk.Toplevel):
@@ -228,10 +254,11 @@ class App(tk.Tk):
         self._clip_last = ""
         self._sort = ("created", True)
         self._last_total_speed = 0.0
+        self._speed_hist = {}                  # tid -> deque[float]（速度曲线数据）
         self._tray = None
 
         self.title(APP_TITLE)
-        self.geometry("1080x640")
+        self.geometry("1200x660")
         self.minsize(860, 480)
         self.configure(bg="#f7f8fa")
         self._init_style()
@@ -321,11 +348,12 @@ class App(tk.Tk):
         wrap = ttk.Frame(self, padding=(8, 6))
         wrap.pack(fill="both", expand=True)
 
-        cols = ("name", "size", "progress", "speed", "eta", "conn", "state", "url")
-        heads = {"name": "文件名", "size": "大小", "progress": "进度", "speed": "速度",
-                 "eta": "剩余", "conn": "连接", "state": "状态", "url": "地址"}
-        widths = {"name": 250, "size": 88, "progress": 176, "speed": 96, "eta": 84,
-                  "conn": 52, "state": 76, "url": 300}
+        cols = ("name", "size", "progress", "graph", "speed", "remain", "eta", "conn", "state", "url")
+        heads = {"name": "文件名", "size": "大小", "progress": "进度", "graph": "速度曲线",
+                 "speed": "速度", "remain": "剩余大小", "eta": "剩余时间", "conn": "连接",
+                 "state": "状态", "url": "地址"}
+        widths = {"name": 220, "size": 84, "progress": 168, "graph": 118, "speed": 90,
+                  "remain": 88, "eta": 84, "conn": 52, "state": 76, "url": 260}
 
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
         for c in cols:
@@ -499,7 +527,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.10\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.11\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -560,24 +588,49 @@ class App(tk.Tk):
         snap = self.mgr.snapshots()
         key, rev = self._sort
         idx = {"name": "name", "size": "size", "progress": "percent",
-               "speed": "speed", "eta": "size", "conn": "connections",
+               "graph": "speed", "speed": "speed", "remain": "size",
+               "eta": "size", "conn": "connections",
                "state": "state", "url": "url"}
         k = idx.get(key, "created")
         snap.sort(key=lambda s: (s.get(k) is None, s.get(k)), reverse=rev)
 
         seen = set()
         total_speed = 0.0
+        total_remain = 0
+        total_size = 0
+        total_done = 0
         for i, s in enumerate(snap):
             seen.add(s["id"])
             total_speed += s["speed"] or 0
             remain = max(0, (s["size"] or 0) - (s["downloaded"] or 0))
+            if s["state"] in ("running", "probing", "queued", "paused"):
+                total_remain += remain
+            if s["size"]:
+                total_size += s["size"]
+            total_done += s["downloaded"] or 0
+
+            # 速度曲线：进行中的任务持续采样；结束后保留最后一段，方便回看
+            hist = self._speed_hist.get(s["id"])
+            if hist is None:
+                hist = self._speed_hist[s["id"]] = deque(maxlen=SPARK_WIDTH)
+            if s["state"] in ("running", "probing"):
+                hist.append(float(s["speed"] or 0))
+
             pct = s["percent"]
+            if s["size"]:
+                remain_txt = human(remain)
+            elif s["state"] in ("running", "probing", "paused"):
+                remain_txt = "未知"      # 服务器未给总长度（chunked）
+            else:
+                remain_txt = "-"
             vals = (
                 s["name"] or os.path.basename(s["target"] or ""),
                 human(s["size"]) if s["size"] else "-",
                 (bar_text(pct) + (" %5.1f%%" % pct if pct is not None else "")) if pct is not None
                 else bar_text(None),
+                sparkline(hist) if hist else "",
                 human_speed(s["speed"]),
+                remain_txt,
                 eta_text(remain, s["speed"]) if s["state"] == "running" else "-",
                 f'{s["connections"]}/{s["max_conn"]}' if s["max_conn"] else "自动",
                 STATE_TXT.get(s["state"], s["state"]),
@@ -592,6 +645,7 @@ class App(tk.Tk):
         for iid in list(self.tree.get_children()):
             if iid not in seen:
                 self.tree.delete(iid)
+                self._speed_hist.pop(iid, None)
 
         if snap:
             self.placeholder.place_forget()
@@ -602,7 +656,14 @@ class App(tk.Tk):
         self.st_left.config(
             text=f"共 {st['total']} 个任务   进行中 {st['active']}   等待 {st['waiting']}   "
                  f"已完成 {st['done']}")
-        self.st_right.config(text=f"总速度  {human_speed(total_speed)}")
+        # 状态栏：总速度 + 总剩余 + 总体进度
+        if total_size:
+            overall = total_done / total_size * 100.0
+            tail = f"总速度  {human_speed(total_speed)}    剩余  {human(total_remain)}    " \
+                   f"总体 {overall:.1f}%"
+        else:
+            tail = f"总速度  {human_speed(total_speed)}    剩余  {human(total_remain)}"
+        self.st_right.config(text=tail)
         self.title(f"{APP_TITLE}  —  {human_speed(total_speed)}" if total_speed
                    else APP_TITLE)
         if self._tray:
