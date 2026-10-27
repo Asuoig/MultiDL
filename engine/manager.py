@@ -70,6 +70,7 @@ class Manager:
         self.config_file = os.path.join(self.data_dir, "config.json")
         self.clipboard_watch = True
         self.proxy_mode = "auto"            # auto | direct | proxy
+        self.proxy_addr = ""                # 自定义代理地址 host:port（可选）
         self._proxy_from_cli = False        # 命令行指定过 --proxy 时，配置不再覆盖
         self._load_config()
         self._load()
@@ -92,15 +93,22 @@ class Manager:
             self._sem = threading.Semaphore(self.max_parallel)
             mode = str(c.get("proxy_mode", "auto")).lower()
             self.proxy_mode = mode if mode in ("auto", "direct", "proxy") else "auto"
+            self.proxy_addr = str(c.get("proxy_addr") or "").strip()
         except Exception:
             pass
         # 命令行没显式指定 --proxy 时，用配置里的网络模式
         if not self._proxy_from_cli:
             try:
                 from .proxy import set_override
-                set_override(self.proxy_mode)
+                set_override(self._effective_proxy())
             except Exception:
                 pass
+
+    def _effective_proxy(self):
+        """代理模式下有自定义地址就用它，否则交给 proxy 模块自动解析。"""
+        if self.proxy_mode == "proxy" and self.proxy_addr:
+            return self.proxy_addr
+        return self.proxy_mode
 
     def _save_config(self):
         try:
@@ -110,7 +118,8 @@ class Manager:
                            "max_parallel": self.max_parallel,
                            "default_conn": self.default_conn,
                            "speed_limit": self.limiter.bps,
-                           "proxy_mode": self.proxy_mode},
+                           "proxy_mode": self.proxy_mode,
+                           "proxy_addr": self.proxy_addr},
                           f, ensure_ascii=False, indent=1)
         except Exception:
             pass
@@ -124,7 +133,19 @@ class Manager:
         self._proxy_from_cli = False
         try:
             from .proxy import set_override
-            set_override(mode)
+            set_override(self._effective_proxy())
+        except Exception:
+            pass
+        self._save_config()
+
+    def set_proxy_addr(self, addr: str):
+        """设置自定义代理地址（host:port）；空字符串表示清除。"""
+        self.proxy_addr = (addr or "").strip()
+        self.proxy_mode = "proxy" if self.proxy_addr else self.proxy_mode
+        self._proxy_from_cli = False
+        try:
+            from .proxy import set_override
+            set_override(self._effective_proxy())
         except Exception:
             pass
         self._save_config()

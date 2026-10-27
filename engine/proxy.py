@@ -12,10 +12,76 @@ from __future__ import annotations
 import sys
 import time
 import fnmatch
+import socket
+import threading
 
 _override = None                                  # (host, port) | "none" | "force" | None
 _cache = {"at": 0.0, "proxy": None, "bypass": ""}
 _CACHE_TTL = 5.0
+
+# 常见本地代理端口（各客户端默认值）：Clash 7890/7897、V2rayN 10809、
+# SS 1080、sing-box 2080、Surge 6152、通用 8080/3128/8888 等
+COMMON_PORTS = (
+    7890, 7897, 7891, 7892, 10809, 10808, 1080, 1087, 8080, 8081,
+    8888, 8889, 3128, 2080, 20171, 2801, 6152, 6153, 8118, 10801,
+)
+
+_detect = {"at": 0.0, "found": None, "busy": False, "done": False}
+
+
+def _probe_http_proxy(host, port, timeout=0.45):
+    """判断 host:port 是不是可用的 HTTP 代理（发 CONNECT 看是否 200）。"""
+    try:
+        s = socket.create_connection((host, port), timeout)
+    except Exception:
+        return False
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"CONNECT www.baidu.com:443 HTTP/1.1\r\n"
+                  b"Host: www.baidu.com:443\r\n\r\n")
+        resp = s.recv(128)
+        first = resp.split(b"\r\n", 1)[0]
+        return b" 200" in first
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def ensure_detect():
+    """后台探测常见代理端口（不阻塞调用方），结果供 detected_proxy() 读取。"""
+    if _detect["busy"]:
+        return
+    if _detect["done"] and time.time() - _detect["at"] < 60:
+        return
+
+    def work():
+        found = None
+        try:
+            for port in COMMON_PORTS:
+                if _probe_http_proxy("127.0.0.1", port):
+                    found = ("127.0.0.1", port)
+                    break
+        finally:
+            _detect["found"] = found
+            _detect["at"] = time.time()
+            _detect["done"] = True
+            _detect["busy"] = False
+
+    _detect["busy"] = True
+    threading.Thread(target=work, daemon=True).start()
+
+
+def detected_proxy():
+    """上一次自动探测的结果（(host, port) 或 None）。"""
+    return _detect["found"]
+
+
+def detect_busy():
+    return _detect["busy"]
 
 
 def _parse(s):
@@ -69,13 +135,26 @@ def current_mode():
     return "auto"
 
 
+def _resolve_force():
+    """「代理」模式下的地址解析顺序：系统代理 → 注册表存过的 → 自动探测。"""
+    px, _ = _load_system()
+    if px:
+        return px, "系统代理"
+    px = _load_server_any()
+    if px:
+        return px, "注册表"
+    px = detected_proxy()
+    if px:
+        return px, "自动探测"
+    return None, ""
+
+
 def active_proxy():
     """对一般外网地址实际会使用的代理 (host, port)；None 表示直连。"""
     if _override == "none":
         return None
     if _override == "force":
-        px, _ = _load_system()
-        return px or _load_server_any()
+        return _resolve_force()[0]
     if _override:
         return _override
     px, _ = _load_system()
@@ -87,12 +166,16 @@ def describe():
     mode = current_mode()
     if mode == "direct":
         return "直连（不走代理）"
+    if mode == "proxy":
+        px, src = _resolve_force() if _override == "force" else (_override, "自定义")
+        if px:
+            return f"代理 {px[0]}:{px[1]}（{src}）"
+        if detect_busy():
+            return "代理（正在探测常见端口…）"
+        return "代理（未找到可用代理，将直连）"
     px = active_proxy()
     if px:
-        tag = "（强制）" if (mode == "proxy" and _override == "force") else ""
-        return f"代理 {px[0]}:{px[1]}{tag}"
-    if mode == "proxy":
-        return "代理（未找到代理地址，将直连）"
+        return f"自动（经代理 {px[0]}:{px[1]}）"
     return "自动（系统未启用代理，将直连）"
 
 
@@ -190,8 +273,7 @@ def proxy_for(host):
     if _override == "force":                      # 强制代理：忽略绕过列表，但本地地址仍直连
         if _is_local(host):
             return None
-        px, _ = _load_system()
-        return px or _load_server_any()
+        return _resolve_force()[0]
     if _override:
         return _override
     if _is_local(host):

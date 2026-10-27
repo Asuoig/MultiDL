@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import queue
@@ -9,7 +10,7 @@ import webbrowser
 import subprocess
 import tkinter as tk
 from collections import deque
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 APP = "MultiDL"
 APP_TITLE = "MultiDL 下载器"
@@ -41,6 +42,7 @@ STATE_TAG = {
 # 网络模式（界面文案 ↔ 内部值）
 NET_LABELS = {"auto": "自动", "direct": "直连", "proxy": "代理"}
 NET_MODES = {v: k for k, v in NET_LABELS.items()}
+NET_CUSTOM = "自定义…"
 
 BAR_FULL = "\u25a0"      # ■ 实心方块
 BAR_EMPTY = "\u25a1"     # □ 空心方块（浅色轨道）
@@ -431,10 +433,10 @@ class App(tk.Tk):
             ttk.Label(s, text=f"浏览器扩展端口 {self.api_port}",
                       background="#eef1f5", foreground="#8a93a0").pack(side="right", padx=14)
 
-        # ---- 网络模式选择：自动 / 直连 / 代理（默认自动，选择会持久化） ----
+        # ---- 网络模式选择：自动 / 直连 / 代理 / 自定义（默认自动，选择会持久化） ----
         ttk.Label(s, text="网络", background="#eef1f5").pack(side="left", padx=(16, 5))
-        self.net_box = ttk.Combobox(s, values=list(NET_LABELS.values()),
-                                    width=5, state="readonly")
+        self.net_box = ttk.Combobox(s, values=list(NET_LABELS.values()) + [NET_CUSTOM],
+                                    width=7, state="readonly")
         self.net_box.set(NET_LABELS.get(self.mgr.proxy_mode, "自动"))
         self.net_box.bind("<<ComboboxSelected>>", self._on_net_mode)
         self.net_box.pack(side="left")
@@ -444,16 +446,47 @@ class App(tk.Tk):
 
     # ---------------- 网络模式 ----------------
     def _on_net_mode(self, _ev=None):
-        mode = NET_MODES.get(self.net_box.get(), "auto")
+        label = self.net_box.get()
+        if label == NET_CUSTOM:
+            self._ask_proxy_addr()
+            return
+        mode = NET_MODES.get(label, "auto")
         try:
             self.mgr.set_proxy_mode(mode)
         except Exception:
             pass
         self._refresh_net_hint()
 
+    def _ask_proxy_addr(self):
+        """自定义代理地址：输入 host:port。"""
+        cur = getattr(self.mgr, "proxy_addr", "") or ""
+        addr = simpledialog.askstring(
+            "自定义代理",
+            "代理地址（host:port）\n例如 127.0.0.1:7890、192.168.1.10:8080\n留空则清除自定义地址",
+            initialvalue=cur, parent=self)
+        if addr is None:                       # 取消 → 恢复下拉显示
+            self.net_box.set(NET_LABELS.get(self.mgr.proxy_mode, "自动"))
+            return
+        addr = addr.strip()
+        if addr and not re.match(r"^[^\s:]+:\d{1,5}$", addr):
+            messagebox.showwarning("地址格式不对",
+                                   f"「{addr}」看起来不是 host:port 格式。\n"
+                                   "例如：127.0.0.1:7890", parent=self)
+            self.net_box.set(NET_LABELS.get(self.mgr.proxy_mode, "自动"))
+            return
+        try:
+            self.mgr.set_proxy_addr(addr)
+        except Exception:
+            pass
+        self.net_box.set(NET_LABELS.get(self.mgr.proxy_mode, "自动"))
+        self._refresh_net_hint()
+
     def _refresh_net_hint(self):
         try:
-            from engine.proxy import describe
+            from engine.proxy import describe, ensure_detect
+            mode = getattr(self.mgr, "proxy_mode", "auto")
+            if mode == "proxy":
+                ensure_detect()                # 后台探测常见端口，不阻塞界面
             self.net_hint.config(text=describe())
         except Exception:
             self.net_hint.config(text="")
@@ -581,7 +614,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.13\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.14\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
