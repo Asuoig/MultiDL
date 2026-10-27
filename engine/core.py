@@ -101,7 +101,7 @@ class SpeedLimiter:
 
 # --------------------------------------------------------------------------
 class Chunk:
-    __slots__ = ("idx", "start", "end", "pos", "done", "error")
+    __slots__ = ("idx", "start", "end", "pos", "done", "error", "claimed")
 
     def __init__(self, idx, start, end):
         self.idx = idx
@@ -110,6 +110,7 @@ class Chunk:
         self.pos = start
         self.done = False
         self.error = None
+        self.claimed = False        # 运行时状态：已被某个 worker 领走（不持久化）
 
     @property
     def size(self):
@@ -614,6 +615,51 @@ class Task:
         self.message = "已完成"
         self.downloaded = self.size or self.downloaded
 
+    # ---------- 动态分配（work stealing） ----------
+    def _claim_next(self):
+        """领一块未完成、未被认领的活；优先领剩余最大的（减少长尾）。"""
+        with self._lock:
+            best = None
+            for c in self.chunks:
+                if c.done or c.claimed or c.remaining <= 0:
+                    continue
+                if best is None or c.remaining > best.remaining:
+                    best = c
+            if best is not None:
+                best.claimed = True
+            return best
+
+    def _steal_split(self):
+        """没整块可领时，从剩余最大的块里切一半出来给空闲连接。
+
+        这是"快的连接帮慢的连接"的关键：慢块被切小后，原来那条连接只需负责前半段，
+        后半段交给空闲连接并行下，尾部等待时间大幅缩短。
+        """
+        if not self.supports_range:
+            return None
+        with self._lock:
+            target = None
+            for c in self.chunks:
+                if c.done or c.remaining < MIN_CHUNK * 2:
+                    continue
+                if target is None or c.remaining > target.remaining:
+                    target = c
+            if target is None:
+                return None
+            rem = target.remaining
+            mid = target.pos + rem // 2
+            if mid <= target.pos or mid > target.end:
+                return None
+            new = Chunk(len(self.chunks), mid, target.end)
+            target.end = mid - 1
+            new.claimed = True
+            self.chunks.append(new)
+            return new
+
+    def _release(self, chunk):
+        with self._lock:
+            chunk.claimed = False
+
     def _dispatch(self, limiter, on_change):
         errors: list[str] = []
 
@@ -622,15 +668,24 @@ class Task:
             if not pending or self.stop.is_set() or self.pause.is_set():
                 break
 
-            workers, self._conns = [], []
+            self._conns = []
+            stop_flag = self.stop
+            pause_flag = self.pause
 
-            def spawn(chunk):
-                c = Conn(self, chunk)
-                self._conns.append(c)
-
-                def body():
+            def worker():
+                """一个 worker 反复领活，直到没活可干。"""
+                while not stop_flag.is_set() and not pause_flag.is_set():
+                    chunk = self._claim_next()
+                    if chunk is None:
+                        chunk = self._steal_split()
+                    if chunk is None:
+                        return                    # 没活了，退出
+                    conn = Conn(self, chunk)
+                    with self._lock:
+                        self._conns.append(conn)
                     try:
-                        c.run(self.stop, self.pause, limiter, self._add)
+                        conn.run(stop_flag, pause_flag, limiter, self._add)
+                        chunk.done = True
                     except Aborted:
                         pass
                     except NoRangeError:
@@ -639,38 +694,30 @@ class Task:
                     except Exception as e:
                         chunk.error = f"{type(e).__name__}: {e}"
                         errors.append(chunk.error)
+                    finally:
+                        self._release(chunk)
+                        with self._lock:
+                            try:
+                                self._conns.remove(conn)
+                            except ValueError:
+                                pass
 
-                th = threading.Thread(target=body, daemon=True)
-                th.start()
-                workers.append(th)
-
-            pending.sort(key=lambda c: -c.remaining)
-            for c in pending[:self.max_conn]:
-                spawn(c)
+            threads = [threading.Thread(target=worker, daemon=True)
+                       for _ in range(max(1, self.max_conn))]
+            for t in threads:
+                t.start()
 
             while True:
                 if self.stop.is_set() or self.pause.is_set():
                     break
-                if not any(w.is_alive() for w in workers):
+                if not any(t.is_alive() for t in threads):
                     break
-
-                if (self.supports_range and not errors
-                        and len(self._conns) < self.max_conn
-                        and self.size >= MIN_CHUNK * 2):
-                    slow = max(self._conns, key=lambda c: c.eta(), default=None)
-                    free = self._max_free()
-                    if (slow and free and free.size >= MIN_CHUNK * 2
-                            and slow.eta() > (len(self._conns) + 1) * HANDSHAKE_COST * 2):
-                        tail = self._split(free)
-                        if tail:
-                            spawn(tail)
-
                 self._speed()
                 on_change(self)
                 time.sleep(GROW_POLL)
 
-            for w in workers:
-                w.join(timeout=30)
+            for t in threads:
+                t.join(timeout=30)
 
             self._save_meta()
             if all(c.done for c in self.chunks):
@@ -705,9 +752,6 @@ class Task:
         on_change(self)
         return self.chunks[0].done
 
-    # 每条连接负责的字节量：太小则握手开销占比过高，4MB 是经验值
-    BYTES_PER_CONN = 4 * MIN_CHUNK
-
     def _resolve_auto_conn(self):
         """自动连接数：至少 8 条（IDM 默认也是 8），大文件最多 16 条。"""
         if self.max_conn is None:
@@ -715,12 +759,18 @@ class Task:
             self.max_conn = min(16, max(8, n))
 
     def _initial_chunks(self):
-        """按文件大小一次性切成 n 段（大文件直接铺满连接数）。"""
+        """按文件大小切块。
+
+        块数取连接数的若干倍（而不是刚好等于连接数）—— 这样谁先下完谁去领下一块，
+        天然负载均衡；只切 8 块的话，某块遇到慢链路就会拖住整个任务。
+        """
         if self.size <= 0:
             return [Chunk(0, 0, -1)]          # end=-1：长度未知，流式读到 EOF
         if not self.supports_range:
             return [Chunk(0, 0, self.size - 1)]
-        n = max(1, min(self.max_conn, self.size // self.BYTES_PER_CONN))
+        conns = max(1, self.max_conn or 8)
+        want = min(conns * 4, self.size // MIN_CHUNK, 64)
+        n = max(1, int(want))
         if n <= 1:
             return [Chunk(0, 0, self.size - 1)]
         step = self.size // n
@@ -730,25 +780,6 @@ class Task:
             b = (self.size - 1) if i == n - 1 else (a + step - 1)
             out.append(Chunk(i, a, b))
         return out
-
-    def _max_free(self):
-        best = None
-        for c in self.chunks:
-            if c.done:
-                continue
-            if best is None or c.remaining > best.remaining:
-                best = c
-        return best if best and best.remaining > 0 else None
-
-    def _split(self, c):
-        rem = c.remaining
-        if rem < MIN_CHUNK * 2:
-            return None
-        mid = c.pos + rem // 2
-        new = Chunk(len(self.chunks), mid, c.end)
-        c.end = mid - 1
-        self.chunks.append(new)
-        return new
 
     def _add(self, n):
         with self._lock:
@@ -793,7 +824,7 @@ class Task:
             "state": self.state, "message": self.message,
             "size": total if known else 0, "downloaded": done, "percent": pct,
             "speed": round(self.speed, 1),
-            "connections": len([c for c in self.chunks if not c.done]),
+            "connections": len(self._conns),      # 活跃连接数（worker pool）
             "max_conn": self.max_conn or 0,
             "content_type": self.content_type,
             "supports_range": self.supports_range,
