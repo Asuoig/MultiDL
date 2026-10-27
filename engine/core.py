@@ -466,6 +466,22 @@ class Task:
                     time.sleep(0.6 * (attempt + 1))
         raise last
 
+    _WEB_EXTS = (".html", ".htm", ".txt", ".xml", ".json", ".md", ".csv", ".m3u8", ".shtml")
+
+    def _looks_like_error_page(self, url):
+        """服务器返回的是「小体积 HTML」→ 多半是错误页/登录页/拦截页，不是真文件。
+
+        典型场景：下载链接失效后 302 到某个镜像的 404 页面（200 + text/html + 几 KB），
+        旧版会把它当文件存下来并标记「已完成」，用户拿到一个假文件。
+        """
+        ct = (self.content_type or "").lower()
+        if "text/html" not in ct:
+            return False
+        if self.size <= 0 or self.size > 64 * 1024:
+            return False
+        ext = os.path.splitext(up.urlsplit(url).path)[1].lower()
+        return ext not in self._WEB_EXTS
+
     def _probe_once(self):
         url = self.url
         for _ in range(8):
@@ -483,7 +499,8 @@ class Task:
             conn = resp = None
             for i, use_proxy in enumerate(attempts):
                 try:
-                    conn = _make_conn(u.scheme, host, port, 20, allow_proxy=use_proxy)
+                    # 探测超时别太长：走代理时若节点不通，20 秒会让人以为程序卡死
+                    conn = _make_conn(u.scheme, host, port, 10, allow_proxy=use_proxy)
                     conn.request("GET", path, headers=h)
                     resp = conn.getresponse()
                     if use_proxy and resp.status in (403, 407, 502, 503) and i < len(attempts) - 1:
@@ -536,6 +553,13 @@ class Task:
             else:
                 conn.close()
                 raise IOError(f"HTTP {resp.status} {resp.reason}")
+
+            if self._looks_like_error_page(url):
+                conn.close()
+                raise IOError(
+                    "服务器返回的是网页（%s，%d 字节），不是文件：链接可能已失效、"
+                    "需要登录，或该站点在拦截下载"
+                    % ((self.content_type or "").split(";")[0], self.size))
             conn.close()
             return
         raise IOError("too many redirects")

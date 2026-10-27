@@ -112,6 +112,13 @@ def _one(task, creq, proxies, on_change) -> bool:
         if r.status_code not in (200, 206):
             return False
 
+        # 小体积 HTML 是错误页/拦截页，不是文件（别把 404 页面存成"下载完成"）
+        ct0 = (r.headers.get("Content-Type") or "").lower()
+        total0 = int(r.headers.get("Content-Length") or 0)
+        if "text/html" in ct0 and 0 < total0 < 64 * 1024:
+            task.message = "服务器返回的是网页（疑似链接失效或被拦截）"
+            return False
+
         ok, got, total = _stream(r, task, part, on_change)
         if not ok:
             return False                                 # 用户取消

@@ -19,10 +19,10 @@ import time
 import urllib.parse as up
 
 CACHE_TTL = 600.0               # 同一 host 的选路结果缓存 10 分钟
-SAMPLE_BYTES = 128 * 1024       # 单连接样本（小一点，慢站也能在超时内测出数）
-SAMPLE_PER_CONN = 64 * 1024     # 多连接探测时每条连接读多少（小样本求快）
+SAMPLE_BYTES = 256 * 1024       # 单连接样本（太小会被 TCP 慢启动主导，测不准）
+SAMPLE_PER_CONN = 256 * 1024    # 多连接探测时每条连接读多少（太小会被慢启动主导）
 SAMPLE_CONNS = 8                # 探测并发数（与默认下载连接数一致）
-SAMPLE_TIMEOUT = 1.5            # 单条路探测超时（只求比较快慢，不让用户干等）
+SAMPLE_TIMEOUT = 3.0            # 单条路探测超时（只求比较快慢，不让用户干等）
 PROXY_ADVANTAGE = 2.0           # 代理要比直连快 1 倍以上才切换（直连优先，省流量少一跳）
 DIRECT_GOOD = 0.5               # 直连达到这个速度(MB/s)就不再测代理，直接用直连
 
@@ -196,7 +196,16 @@ def _probe_both(url, px):
     if direct is not None and direct >= DIRECT_GOOD:
         return direct, None, True          # 直连够快，不必测代理
 
-    # 2) 直连慢或不通，才测代理（有大小就走多连接，更接近真实下载）
+    # 2) 直连单连接慢 ≠ 直连慢：很多站对单连接限速（TUNA 单连接 0.07MB/s、多连接 30MB/s）。
+    #    先用多连接复核一次，否则会误判成"代理更快"，然后被一个不通的节点坑住。
+    if ranged and size > SAMPLE_PER_CONN * 2:
+        multi = _sample_parallel(url, None, size)
+        if multi and (direct is None or multi > direct * 1.5):
+            direct = multi
+            if direct >= DIRECT_GOOD:
+                return direct, None, True
+
+    # 3) 直连确实慢或不通，才测代理（有大小就走多连接，更接近真实下载）
     proxied = None
     if pdict:
         if ranged and size > SAMPLE_PER_CONN * 2:
