@@ -130,6 +130,7 @@ def _one(task, creq, proxies, on_change) -> bool:
                 return False
 
         if got == 0 or (total == 0 and got < MIN_SANE_CHUNKED):
+            task.message = "镜像站拒绝访问（返回空响应）"
             return False                                 # 仍被拦 / 假响应
         if total and got < total:
             return False

@@ -520,7 +520,7 @@ class Task:
             if all(c.done for c in self.chunks):
                 if self.size <= 0 and self.downloaded < MIN_SANE_UNKNOWN:
                     # chunked 无长度却只拿到极少字节：服务器反爬的"假响应"（如 USTC 返回 0~1 字节）
-                    raise IOError(f"服务器返回异常小的响应（{self.downloaded} 字节），疑似被反爬拦截")
+                    raise IOError("镜像站拒绝访问（返回空响应）")
                 self._finalize()
             elif self.stop.is_set():
                 self.state = "canceled"
@@ -535,7 +535,9 @@ class Task:
                 if not self.stop.is_set() and self._try_fallback(on_change):
                     return
                 self.state = "error"
-                self.message = self._final_error(errs[0] if errs else "下载未完成")
+                # errs 为空时沿用兜底写入的消息（如"镜像站拒绝访问"），比"下载未完成"更有用
+                self.message = self._final_error(
+                    errs[0] if errs else (self.message or "下载未完成"))
         except Aborted:
             self.state = "canceled" if self.stop.is_set() else "paused"
             self.message = "已取消" if self.stop.is_set() else "已暂停"
@@ -582,6 +584,10 @@ class Task:
 
     def _final_error(self, err):
         low = (err or "").lower()
+        # 站点明确拒绝（返回空 body / 极少量数据）：IP 或网络被限流、封禁，与客户端无关
+        if "异常小的响应" in err or "拒绝访问" in err:
+            return ("镜像站拒绝了本机访问（返回空响应或极少数据）：IP / 网络被限流或封禁，"
+                    "请换一个镜像站或换网络（如手机热点）")
         netish = any(k in low for k in (
             "403", "407", "连接失败", "空响应", "timed out", "timeout", "eof",
             "reset", "ssl", "urlopen", "10060", "10054", "connection", "aborted"))
