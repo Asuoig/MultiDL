@@ -108,6 +108,7 @@ python test/bench.py
 - ✅ HLS（m3u8，未加密流；加密流明确报错）
 - ✅ 剪贴板监视
 - ✅ 防盗链 Referer / Cookie
+- ✅ **浏览器指纹模式（反爬绕过）**：当 curl_cffi 的 `impersonate="chrome"` 仍被识别为机器人时（如某些镜像站的 JS 反爬、WAF），可启用「选项 → 网络模式 → 浏览器指纹」。程序会启动 Selenium/Playwright 控制的真实 Chrome 进程，完全模拟人眼浏览器的 UA、Accept-Encoding、TLS JA3、WebGL 等特征。支持大文件分块读取 + 多连接调度（与 MultiDL 核心引擎一致）。
 - ✅ 浏览器接管（可选扩展）
 - ✅ 系统托盘常驻（关闭窗口缩到右下角，托盘菜单可暂停 / 继续 / 退出）
 - ✅ 代理支持（默认读 Windows 系统代理，Clash 等自动生效；可 `--proxy` 指定；本地地址直连）
