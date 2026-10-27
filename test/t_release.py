@@ -85,6 +85,16 @@ check("伪造 Host 被拒 (403)", c == 403, f"HTTP {c}")
 c, h, _ = req("/api/tasks", headers={"Origin": EXT})
 check("扩展来源可读 (200)", c == 200, f"HTTP {c}")
 
+# 扩展标记头通道：兜底「某天 Chrome 把扩展 Origin 改成 null」
+c, _, _ = req("/api/tasks", "POST",
+              {"url": "http://127.0.0.1:1/probe.bin", "autostart": False},
+              {"Origin": "null", "X-MultiDL-Ext": "1"})
+check("Origin:null + 扩展标记头 → 放行（兼容通道）", c == 200, f"HTTP {c}")
+c, _, _ = req("/api/tasks", method="OPTIONS",
+              headers={"Origin": "null", "X-MultiDL-Ext": "1",
+                       "Access-Control-Request-Method": "POST"})
+check("预检不认扩展标记头（网页无法借预检过关）", c == 403, f"HTTP {c}")
+
 print("\n=== 2. 请求体约束 ===")
 c, _, b = req("/api/tasks", "POST", {"url": "http://127.0.0.1:1/a.bin"}, ctype="text/plain")
 check("text/plain 被拒 (415)", c == 415, f"HTTP {c} {b[:60]}")

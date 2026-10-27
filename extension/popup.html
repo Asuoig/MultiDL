@@ -47,6 +47,11 @@ const ping = () => chrome.runtime.sendMessage({ type: "ping" }, r => {
   const on = r && r.ok;
   $('#dot').className = "dot" + (on ? " on" : "");
   $('#st').textContent = on ? "已连接" : "未连接";
+  if (!on) {
+    // 最常见的原因就是客户端没开 —— 直接说清楚，别让用户以为扩展坏了
+    $('#hint').textContent =
+      "客户端未启动：请先打开 MultiDL（桌面上的 MultiDL.exe），否则浏览器会自己下载。";
+  }
 });
 $('#port').onchange = () => {
   chrome.storage.local.set({ port: Number($('#port').value) || 8765 }, ping);

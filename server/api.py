@@ -27,6 +27,7 @@ from engine.manager import Manager
 MAX_BODY = 256 * 1024            # 请求体上限（任务/设置都远小于此）
 _EXT_ORIGIN_PREFIX = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
 _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+EXT_HEADER = "X-MultiDL-Ext"     # 扩展专用标记头（见 _gate 说明）
 
 
 def _inside(root: str, path: str) -> bool:
@@ -64,7 +65,7 @@ def _cors(handler):
     if o and _origin_allowed(o):
         handler.send_header("Access-Control-Allow-Origin", o)
         handler.send_header("Vary", "Origin")
-        handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        handler.send_header("Access-Control-Allow-Headers", f"Content-Type, {EXT_HEADER}")
         handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
 
@@ -91,14 +92,32 @@ def make_server(mgr: Manager, port: int = 8765):
         def _gate(self):
             """Host / Origin 双重校验。返回 False 表示已回 403，调用方直接返回。"""
             if not self._host_ok():
-                _json(self, {"ok": False, "error": "host not allowed"}, 403)
+                self._deny("host not allowed")
                 return False
+            # 扩展专用标记头：网页在「简单请求」里设不了自定义头，带它会触发 CORS 预检，
+            # 而预检（do_OPTIONS）仍严格校验 Origin → 网页拿不到通行证；扩展有
+            # host_permissions，不受 CORS 约束，可以直接携带。
+            # 这条通道用于兜底「某天 Chrome 把扩展请求的 Origin 改成 null」的情况。
+            if (self.headers.get(EXT_HEADER) or "").strip() == "1":
+                return True
             o = (self.headers.get("Origin") or "").strip()
             if not _origin_allowed(o):
-                _json(self, {"ok": False,
-                             "error": "cross-site request blocked"}, 403)
+                self._deny("cross-site request blocked")
                 return False
             return True
+
+        def _deny(self, msg, code=403):
+            """拒绝并留痕 —— 线上「扩展接管失效」时全靠这条日志归因。"""
+            try:
+                import diag
+                diag.get_logger().warning(
+                    "API 拒绝 %s %s：%s（Origin=%r Host=%r UA=%r）",
+                    self.command, self.path, msg,
+                    self.headers.get("Origin"), self.headers.get("Host"),
+                    (self.headers.get("User-Agent") or "")[:48])
+            except Exception:
+                pass
+            _json(self, {"ok": False, "error": msg}, code)
 
         # ---------- 工具 ----------
         def _body(self):
@@ -153,6 +172,7 @@ def make_server(mgr: Manager, port: int = 8765):
 
         # ---------- 路由 ----------
         def do_OPTIONS(self):
+            # 预检必须严格：不认 EXT_HEADER，否则网页就能靠预检拿到通行证
             if not self._host_ok() or not _origin_allowed(self.headers.get("Origin") or ""):
                 self.send_response(403)
                 self.send_header("Content-Length", "0")

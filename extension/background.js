@@ -4,16 +4,41 @@
 
 const DEFAULTS = { port: 8765, enabled: true, minSize: 0 };
 
+// 扩展标记头：客户端据此确认「这是扩展发的，不是网页」。
+// 网页在简单请求里设不了自定义头，带它会触发 CORS 预检，而预检仍严格校验来源。
+const EXT_HEADERS = { "Content-Type": "application/json", "X-MultiDL-Ext": "1" };
+
 async function cfg() {
   const s = await chrome.storage.local.get(DEFAULTS);
   return { ...DEFAULTS, ...s };
+}
+
+// 接管失败要让人看得见：以前是静默吞异常，用户只会觉得"扩展坏了"
+let _lastNotify = 0;
+function notifyOffline(port, reason) {
+  try {
+    chrome.action.setBadgeText({ text: "!" });
+    chrome.action.setBadgeBackgroundColor({ color: "#dc2626" });
+  } catch (e) {}
+  const now = Date.now();
+  if (now - _lastNotify < 30000) return;      // 30 秒内只弹一次，避免刷屏
+  _lastNotify = now;
+  try {
+    chrome.notifications.create("multidl-offline", {
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: "MultiDL 没有接管下载",
+      message: `已交回浏览器下载。请先启动 MultiDL 客户端（端口 ${port}）。` +
+               (reason ? `\n原因：${reason}` : "")
+    }, () => void chrome.runtime.lastError);
+  } catch (e) {}
 }
 
 async function api(path, body) {
   const c = await cfg();
   const r = await fetch(`http://127.0.0.1:${c.port}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: EXT_HEADERS,
     body: JSON.stringify(body || {})
   });
   if (r.status === 403) {
@@ -32,7 +57,12 @@ async function api(path, body) {
 
 function ping() {
   return cfg().then(c =>
-    fetch(`http://127.0.0.1:${c.port}/api/settings`).then(r => r.ok).catch(() => false)
+    fetch(`http://127.0.0.1:${c.port}/api/settings`, { headers: { "X-MultiDL-Ext": "1" } })
+      .then(r => {
+        if (r.ok) chrome.action.setBadgeText({ text: "" });   // 连上了就清掉红色感叹号
+        return r.ok;
+      })
+      .catch(() => false)
   );
 }
 
@@ -55,16 +85,19 @@ chrome.downloads.onCreated.addListener(async (item) => {
     if (res.ok) {
       chrome.downloads.cancel(item.id, () => void chrome.runtime.lastError);
       chrome.downloads.erase({ id: item.id }, () => void chrome.runtime.lastError);
-      chrome.action.setBadgeText({ text: "1" });
       chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
+      chrome.action.setBadgeText({ text: "1" });
       setTimeout(() => chrome.action.setBadgeText({ text: "" }), 4000);
     } else {
-      chrome.storage.local.set({ lastError: `投递被拒：${res.error || "未知"} ${new Date().toLocaleTimeString()}` });
+      const why = res.error || "未知原因";
+      chrome.storage.local.set({ lastError: `投递被拒：${why} ${new Date().toLocaleTimeString()}` });
+      notifyOffline(c.port, why);
     }
   } catch (e) {
-    // 本地服务没开 → 不接管，让浏览器自己下（下载不会丢）
+    // 本地服务没开 → 不接管，让浏览器自己下（下载不会丢），但必须让用户知道
     chrome.storage.local.set({ lastError: `连不上本地服务（端口 ${c.port}）：${String(e)}` });
     console.warn("[MultiDL] 投递失败，已交回浏览器", e);
+    notifyOffline(c.port, "连不上本地服务");
   }
 });
 
