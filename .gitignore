@@ -28,3 +28,6 @@ _internal/
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# ---- 测试残留（临时数据目录）----
+test/_*/
