@@ -638,6 +638,20 @@ class App(tk.Tk):
             self.mgr.set_proxy_mode(mode)
         except Exception:
             pass
+        # 浏览器指纹模式：立即检测依赖并反馈，切走时关闭浏览器进程
+        from engine.browser import get_downloader
+        if mode == "browser":
+            ok, why = get_downloader().start()
+            if ok:
+                messagebox.showinfo(
+                    "浏览器指纹模式",
+                    f"浏览器指纹模式已就绪（后端：{why}）。\n"
+                    "该模式下下载将先由真实浏览器过反爬，再用引擎拉取正文。",
+                    parent=self)
+            else:
+                messagebox.showwarning("浏览器指纹模式不可用", why, parent=self)
+        else:
+            get_downloader().stop()
         self._refresh_net_hint()
 
     def _ask_proxy_addr(self):
