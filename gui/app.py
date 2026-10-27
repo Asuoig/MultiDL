@@ -77,28 +77,49 @@ def bar_text(pct, width=10):
     return BAR_FULL * k + BAR_EMPTY * (width - k)
 
 
-# ---- 速度可视化（Unicode 块字符 sparkline，纯 tkinter 可用） ----
+# ---- 速度可视化 ----
+# 实心块 ▁▂▃▄▅▆▇█ 对比度最高（实心 vs 空白），小字号下比盲文点阵看得清；
+# 点数控制在 16 个以内，避免一排大黑块的笨重感。
 SPARK_CHARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"   # ▁▂▃▄▅▆▇█
-SPARK_WIDTH = 14
+SPARK_WIDTH = 16
 
 
-def sparkline(hist, width=SPARK_WIDTH):
-    """把速度历史画成柱状曲线：高度按窗口内峰值归一化。"""
+def sparkline(hist, peak=None, width=SPARK_WIDTH):
+    """把速度历史画成柱状曲线。
+
+    高度以「窗口内平均速度」为基准（不是峰值）：
+    - 速度稳定时曲线落在中间档，不会顶成一排满格黑块；
+    - 掉速会明显掉到底部，提速会顶到顶部，变化一眼可见；
+    - 样本不足 3 个时退回用 peak / 首个样本兜底。
+    """
     if not hist:
         return ""
     data = list(hist)[-width:]
     if len(data) < width:                      # 右侧对齐，左边补空
         data = [None] * (width - len(data)) + data
-    mx = max([v for v in data if v] or [0.0])
-    if mx <= 0:
+
+    vals = [v for v in data if v]
+    if len(vals) >= 3:
+        base = sum(vals) / len(vals)
+    elif peak:
+        base = peak
+    elif vals:
+        base = vals[0]
+    else:
         return ""
+    if base <= 0:
+        return ""
+
+    n = len(SPARK_CHARS) - 1
     out = []
     for v in data:
         if not v:
             out.append(" ")
-        else:
-            k = int(round((v / mx) * (len(SPARK_CHARS) - 1)))
-            out.append(SPARK_CHARS[max(0, min(len(SPARK_CHARS) - 1, k))])
+            continue
+        # 灵敏度：比平均慢 25% → 最低档；等于平均 → 中间档；快 25% → 最高档。
+        # 区间收窄是为了让 ±20% 左右的日常波动也看得见（区间太宽会显得一条直线）。
+        k = int(round((v / base - 0.75) / 0.5 * n))
+        out.append(SPARK_CHARS[max(0, min(n, k))])
     return "".join(out)
 
 
@@ -255,10 +276,11 @@ class App(tk.Tk):
         self._sort = ("created", True)
         self._last_total_speed = 0.0
         self._speed_hist = {}                  # tid -> deque[float]（速度曲线数据）
+        self._dl_prev = {}                     # tid -> (已下载字节, 时间戳)，用来算瞬时速度
         self._tray = None
 
         self.title(APP_TITLE)
-        self.geometry("1200x660")
+        self.geometry("1260x680")
         self.minsize(860, 480)
         self.configure(bg="#f7f8fa")
         self._init_style()
@@ -352,8 +374,8 @@ class App(tk.Tk):
         heads = {"name": "文件名", "size": "大小", "progress": "进度", "graph": "速度曲线",
                  "speed": "速度", "remain": "剩余大小", "eta": "剩余时间", "conn": "连接",
                  "state": "状态", "url": "地址"}
-        widths = {"name": 220, "size": 84, "progress": 168, "graph": 118, "speed": 90,
-                  "remain": 88, "eta": 84, "conn": 52, "state": 76, "url": 260}
+        widths = {"name": 196, "size": 80, "progress": 152, "graph": 148, "speed": 84,
+                  "remain": 84, "eta": 78, "conn": 48, "state": 72, "url": 220}
 
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
         for c in cols:
@@ -527,7 +549,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.11\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.12\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -586,6 +608,7 @@ class App(tk.Tk):
 
     def refresh(self):
         snap = self.mgr.snapshots()
+        now = time.monotonic()
         key, rev = self._sort
         idx = {"name": "name", "size": "size", "progress": "percent",
                "graph": "speed", "speed": "speed", "remain": "size",
@@ -609,12 +632,20 @@ class App(tk.Tk):
                 total_size += s["size"]
             total_done += s["downloaded"] or 0
 
-            # 速度曲线：进行中的任务持续采样；结束后保留最后一段，方便回看
+            # 速度曲线：用「两次刷新间的字节增量」算瞬时速度。
+            # task.speed 是累计平均速度，会把波动抹平（曲线永远一条直线），
+            # 而且刚启动时还没更新就是 0；增量法能真实反映每一次卡顿和冲高。
             hist = self._speed_hist.get(s["id"])
             if hist is None:
                 hist = self._speed_hist[s["id"]] = deque(maxlen=SPARK_WIDTH)
             if s["state"] in ("running", "probing"):
-                hist.append(float(s["speed"] or 0))
+                done_bytes = int(s["downloaded"] or 0)
+                prev = self._dl_prev.get(s["id"])
+                if prev is not None:
+                    dt = now - prev[1]
+                    inst = (done_bytes - prev[0]) / dt if dt > 0.05 else 0.0
+                    hist.append(max(0.0, inst))
+                self._dl_prev[s["id"]] = (done_bytes, now)
 
             pct = s["percent"]
             if s["size"]:
@@ -646,6 +677,7 @@ class App(tk.Tk):
             if iid not in seen:
                 self.tree.delete(iid)
                 self._speed_hist.pop(iid, None)
+                self._dl_prev.pop(iid, None)
 
         if snap:
             self.placeholder.place_forget()
