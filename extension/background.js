@@ -16,7 +16,18 @@ async function api(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
   });
-  return r.json();
+  if (r.status === 403) {
+    // 本地服务拒绝：多半是客户端版本不匹配（新版对来源做了校验）
+    const e = { ok: false, error: "本地服务拒绝（403），请把 MultiDL 客户端和扩展一起更新到同一版本" };
+    chrome.storage.local.set({ lastError: e.error + " " + new Date().toLocaleTimeString() });
+    console.warn("[MultiDL]", e.error);
+    return e;
+  }
+  try {
+    return await r.json();
+  } catch (e) {
+    return { ok: false, error: `HTTP ${r.status}` };
+  }
 }
 
 function ping() {
@@ -47,9 +58,13 @@ chrome.downloads.onCreated.addListener(async (item) => {
       chrome.action.setBadgeText({ text: "1" });
       chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
       setTimeout(() => chrome.action.setBadgeText({ text: "" }), 4000);
+    } else {
+      chrome.storage.local.set({ lastError: `投递被拒：${res.error || "未知"} ${new Date().toLocaleTimeString()}` });
     }
   } catch (e) {
-    // 本地服务没开 → 不接管，让浏览器自己下
+    // 本地服务没开 → 不接管，让浏览器自己下（下载不会丢）
+    chrome.storage.local.set({ lastError: `连不上本地服务（端口 ${c.port}）：${String(e)}` });
+    console.warn("[MultiDL] 投递失败，已交回浏览器", e);
   }
 });
 

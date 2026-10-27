@@ -95,12 +95,23 @@ def _parse(s):
     s = s.rstrip("/")
     if "@" in s:                                  # user:pass@host:port → 丢弃认证部分
         s = s.rsplit("@", 1)[1]
+    # IPv6 写法 [::1]:7890
+    if s.startswith("["):
+        host, _, rest = s[1:].partition("]")
+        port = 80
+        if rest.startswith(":"):
+            try:
+                port = int(rest[1:])
+            except ValueError:
+                return None
+        return (host, port) if host and 0 < port < 65536 else None
     if s.count(":") == 1:
         h, p = s.split(":")
         try:
-            return (h.strip(), int(p))
+            port = int(p)
         except ValueError:
             return None
+        return (h.strip(), port) if h.strip() and 0 < port < 65536 else None
     return (s, 80) if s else None
 
 

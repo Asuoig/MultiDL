@@ -68,8 +68,15 @@ def _one(task, creq, proxies, on_change) -> bool:
     r = creq.get(url, impersonate="chrome", proxies=proxies, stream=True, timeout=30,
                  headers=hdrs or None)
     ct = (r.headers.get("Content-Type") or "")
-    is_verify_page = (r.status_code == 200 and "text/html" in ct
-                      and "Verifying" in r.text[:500])
+    # 注意：stream=True 时读 .text 会把整个 body 读进内存，且 r.close() 之后就读不到了。
+    # 所以先只在「看起来像 HTML」时取前 1KB 文本留作后面判断，不要在 close 之后再用 r.text。
+    head = ""
+    if r.status_code == 200 and "text/html" in ct.lower():
+        try:
+            head = r.text[:1000]
+        except Exception:
+            head = ""
+    is_verify_page = "Verifying" in head
 
     try:
         if is_verify_page:
@@ -80,12 +87,12 @@ def _one(task, creq, proxies, on_change) -> bool:
             on_change(task)
             task.message = "浏览器指纹兜底：等待验证…（正在通过指纹绕过）"
             import re
-            m = re.search(r"addr=([^;\"']*)", r.text)
+            m = re.search(r"addr=([^;\"']*)", head)
             if m:
                 verify_cookie = f"addr={m.group(1)}"
             else:
                 # 从 Set-Cookie 或页面提取
-                m2 = re.search(r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", r.text)
+                m2 = re.search(r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", head)
                 verify_cookie = f"addr={m2.group(1)}" if m2 else ""
 
             if verify_cookie:
@@ -132,6 +139,11 @@ def _one(task, creq, proxies, on_change) -> bool:
         if got == 0 or (total == 0 and got < MIN_SANE_CHUNKED):
             task.message = "镜像站拒绝访问（返回空响应）"
             return False                                 # 仍被拦 / 假响应
+        # 兜底是「引擎失败后的最后一招」：如果服务器只给了几百字节还声称就是全部，
+        # 那更可能是拦截页/假响应，不能当成功（否则会产出 1B 假文件）
+        if 0 < total < 1024:
+            task.message = "镜像站拒绝访问（响应过小，疑似拦截页）"
+            return False
         if total and got < total:
             return False
         os.replace(part, task.target)

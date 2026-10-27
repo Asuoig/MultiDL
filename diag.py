@@ -18,7 +18,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 APP_NAME = "MultiDL"
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 
 _root = None          # tkinter 根窗口（装好界面后由 install(root) 赋值）
 _log_file = None
@@ -85,6 +85,28 @@ def setup_logging(level=logging.INFO):
 
 def get_logger(name=APP_NAME):
     return logging.getLogger(name)
+
+
+def mask_url(u, keep=90):
+    """日志/诊断用：隐去 query（常含签名 token）与 URL 里的账号密码。"""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(str(u or ""))
+        host = p.hostname or ""
+        if p.port:
+            host += f":{p.port}"
+        out = f"{p.scheme}://{host}{p.path or '/'}"
+        if p.query:
+            out += "?<已隐去>"
+        return out[:keep] + ("…" if len(out) > keep else "")
+    except Exception:
+        return "<url>"
+
+
+def mask_proxy(v):
+    """--proxy 可能是 user:pass@host:port，日志里只留 host:port。"""
+    s = str(v or "")
+    return s.rsplit("@", 1)[-1] if "@" in s else s
 
 
 # ---------------- 崩溃处理 ----------------

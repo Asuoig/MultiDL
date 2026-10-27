@@ -5,11 +5,12 @@ import os
 import re
 import ssl
 import time
+import shutil
 import threading
 import http.client
 import urllib.parse as up
 
-from .core import DEFAULT_UA
+from .core import DEFAULT_UA, _make_conn
 
 
 def is_hls(url: str) -> bool:
@@ -22,11 +23,8 @@ def _fetch(url, headers, timeout=25, limit=1 << 24):
     host = u.hostname
     port = u.port or (443 if u.scheme == "https" else 80)
     path = (u.path or "/") + (("?" + u.query) if u.query else "")
-    if u.scheme == "https":
-        c = http.client.HTTPSConnection(host, port, timeout=timeout,
-                                        context=ssl.create_default_context())
-    else:
-        c = http.client.HTTPConnection(host, port, timeout=timeout)
+    # 走统一的连接工厂：这样 HLS 也会遵守代理配置与自动选路
+    c = _make_conn(u.scheme, host, port, timeout)
     h = dict(headers)
     h.setdefault("User-Agent", DEFAULT_UA)
     c.request("GET", path, headers=h)
@@ -88,19 +86,18 @@ def hls_download(sess, limiter, on_change):
     parts = []
     t0 = time.monotonic()
     for i, s in enumerate(segs):
+        # 暂停要能真正停住：旧写法内层 break 只跳出 while，外层接着下分段
+        while sess.pause.is_set() and not sess.stop.is_set():
+            time.sleep(0.2)
         if sess.stop.is_set():
             break
-        while sess.pause.is_set():
-            if sess.stop.is_set():
-                break
-            time.sleep(0.2)
         p = os.path.join(sess.tmpdir, f"seg_{i:05d}.ts")
         parts.append(p)
         if os.path.exists(p) and os.path.getsize(p) > 0:
             sess.downloaded = i + 1
             continue
         data = _fetch(s["url"], headers, timeout=40)
-        limiter.consume(len(data), should_stop=sess.stop.is_set)
+        limiter.consume(len(data), stop=sess.stop.is_set)
         with open(p, "wb") as f:
             f.write(data)
         sess.downloaded = i + 1
@@ -134,3 +131,4 @@ def hls_download(sess, limiter, on_change):
     sess.finished = time.time()
     sess.speed = 0.0
     on_change(sess)
+    shutil.rmtree(sess.tmpdir, ignore_errors=True)     # 分段已拼完，清掉临时目录

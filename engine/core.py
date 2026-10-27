@@ -55,10 +55,39 @@ READ_BLOCK = 1 << 18          # 256 KiB
 MIN_SANE_UNKNOWN = 4096       # 长度未知(chunked)时，小于此字节数视为"假响应"
 PART_SUFFIX = ".dlpart"
 META_SUFFIX = ".dlmeta"
+CHUNK_MAX_TRIES = 3           # 单个分块最多重试次数（超过就判定任务失败，避免死循环）
+MAX_DECLARED_SIZE = 8 << 40   # 服务器声明的文件大小硬上限（8 TiB），防异常值
+PREALLOC_LIMIT = 64 << 30     # 超过 64 GiB 不再预分配（避免 NTFS 提前占满磁盘）
+
+# 任务 ID：毫秒时间戳 + 进程内自增序号 + URL 散列。
+# 旧实现只用「毫秒 + hash(url)%1000」，同一毫秒添加同一 URL 会撞 ID，
+# 导致任务互相覆盖、order 出现重复项（界面出现重复行且删不掉）。
+_id_lock = threading.Lock()
+_id_seq = 0
+
+
+def _new_task_id(url):
+    global _id_seq
+    with _id_lock:
+        _id_seq = (_id_seq + 1) % 1000
+        seq = _id_seq
+    return "%09d%03d%03d" % (int(time.time() * 1000) % 10 ** 9,
+                             abs(hash(url)) % 1000, seq)
 
 
 class NoRangeError(Exception):
     pass
+
+
+class FatalError(Exception):
+    """不可恢复错误（尺寸异常 / 空间不足）：重试和兜底都不会成功，直接失败。"""
+
+
+def _clean_name(name):
+    """压成安全的单段文件名：去路径分隔符/非法字符/控制字符，去掉结尾的点与空白。"""
+    s = "".join(("_" if (ord(c) < 32 or c in '\\/:*?"<>|') else c) for c in str(name or ""))
+    s = s.strip().strip(".").strip()
+    return s[:150] or "download.bin"
 
 
 class Aborted(Exception):
@@ -261,8 +290,7 @@ class Conn:
 class Task:
     def __init__(self, url, target, *, headers=None, ua=None, referer=None,
                  cookie=None, max_conn=8, task_id=None, filename_hint=None):
-        self.id = task_id or ("%d%03d" % (int(time.time() * 1000) % 10 ** 9,
-                                          abs(hash(url)) % 1000))
+        self.id = task_id or _new_task_id(url)
         self.url = url
         self.final_url = None
         self.target = target
@@ -302,6 +330,8 @@ class Task:
         self.stop = threading.Event()
         self.pause = threading.Event()
         self._runner = False
+        self._started = False        # 是否已有线程在跑（start() 幂等用，防止重复起线程）
+        self._thread = None          # 当前工作线程（resume 时要等它退出）
         self._lock = threading.Lock()
         self._conns: list[Conn] = []
         self._bytes = 0
@@ -355,10 +385,16 @@ class Task:
         if self.size <= 0:
             return                       # 长度未知（chunked）无法安全续传，不写进度
         try:
-            with open(self.meta_path, "w", encoding="utf-8") as f:
+            # 原子写：先写临时文件再 replace。进程被强杀时不会留下半截 JSON
+            # （半截 meta 会被 _load_meta 的 except 吞掉 → 退化成"找不到进度"→ 从头下）
+            tmp = self.meta_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"url": self.url, "size": self.size, "etag": self.etag,
                            "lm": self.last_modified,
                            "chunks": [c.d() for c in self.chunks]}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.meta_path)
         except Exception:
             pass
 
@@ -387,6 +423,32 @@ class Task:
                     os.remove(p)
             except Exception:
                 pass
+
+    def _preallocate(self, path):
+        """按声明大小预分配（稀疏），但对异常尺寸与空间不足提前拒绝。
+
+        NTFS 上 truncate 会真的分配簇（实测 truncate(100GB) 吃掉了 42GB 实盘），
+        所以恶意/错误服务器声明一个巨大 Content-Length 就能把用户磁盘写满。
+        这里：超硬上限直接失败；超可用空间直接失败；超大文件不预分配（边下边扩）。
+        """
+        size = self.size or 0
+        if size <= 0:
+            with open(path, "wb"):
+                pass
+            return
+        if size > MAX_DECLARED_SIZE:
+            raise FatalError("服务器声明的文件大小异常（%d 字节），已拒绝下载" % size)
+        free = None
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(path)) or ".").free
+        except Exception:
+            pass
+        if free is not None and size > free * 0.95:
+            raise FatalError("磁盘空间不足：需要 %.1f GB，可用 %.1f GB"
+                             % (size / 1073741824.0, free / 1073741824.0))
+        with open(path, "wb") as f:
+            if size <= PREALLOC_LIMIT and (free is None or size <= free * 0.6):
+                f.truncate(size)
 
     # ---------- 探测 ----------
     def probe(self):
@@ -479,20 +541,18 @@ class Task:
 
     def guess_name(self):
         if self.filename_hint:
-            return self.filename_hint
+            return _clean_name(self.filename_hint)
         # 优先用服务器给的 Content-Disposition 文件名
         cd = self.content_disposition or ""
         if cd:
             m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", cd, re.I)
             if m:
-                name = up.unquote(m.group(1).strip())
-                name = re.sub(r'[\\/:*?"<>|]', "_", name)[:150]
+                name = _clean_name(up.unquote(m.group(1).strip()))
                 if name:
                     return name
         # 其次用「重定向后的最终 URL」——原始 URL 常常是 /download/latest/win32/x64 这种
         u = up.urlsplit(self.final_url or self.url)
-        name = os.path.basename(up.unquote(u.path)) or "download.bin"
-        return re.sub(r'[\\/:*?"<>|]', "_", name)[:150]
+        return _clean_name(os.path.basename(up.unquote(u.path)) or "download.bin")
 
     def _fix_target_name(self):
         """探测拿到最终 URL 后，修正自动取的文件名。
@@ -550,7 +610,7 @@ class Task:
             self.route_reason = reason
             try:
                 import diag
-                diag.get_logger().info("自动选路 %s → %s（%s）", self.url,
+                diag.get_logger().info("自动选路 %s → %s（%s）", diag.mask_url(self.url),
                                        "代理" if use else "直连", reason)
             except Exception:
                 pass
@@ -581,10 +641,8 @@ class Task:
                 self._fix_target_name()        # 用重定向后的真实文件名（原始 URL 常没有扩展名）
                 self._drop_progress()          # 清掉旧进度（会清空 chunks）
                 os.makedirs(os.path.dirname(os.path.abspath(self.target)) or ".", exist_ok=True)
-                # 预分配目标大小（稀疏），后续各连接直接定位写
-                with open(self.part_path, "wb") as f:
-                    if self.size:
-                        f.truncate(self.size)
+                # 预分配目标大小（稀疏），并校验尺寸是否合理
+                self._preallocate(self.part_path)
                 self._resolve_auto_conn()
                 self.chunks = self._initial_chunks()
 
@@ -614,7 +672,7 @@ class Task:
             elif self.stop.is_set():
                 self.state = "canceled"
                 self.message = "已取消"
-            elif self.pause.is_set():
+            elif self.pause.is_set() or "paused" in errs:
                 self.state = "paused"
                 self.message = "已暂停"
             elif any(e == "no-range" for e in errs):
@@ -630,6 +688,9 @@ class Task:
         except Aborted:
             self.state = "canceled" if self.stop.is_set() else "paused"
             self.message = "已取消" if self.stop.is_set() else "已暂停"
+        except FatalError as e:
+            self.state = "error"
+            self.message = str(e)              # 尺寸/空间问题，兜底也没意义
         except Exception as e:
             if self.stop.is_set():
                 self.state = "canceled"
@@ -651,6 +712,16 @@ class Task:
 
     def _try_fallback(self, on_change):
         """原生引擎失败时，尝试 curl_cffi（Chrome 指纹）兜底；没装则跳过。"""
+        # FTP 走 ftplib、HLS 是播放列表：都不适合用 HTTP 兜底。
+        # 尤其 HLS —— 兜底会把 m3u8 文本当成视频文件存下来并标记"已完成"。
+        if up.urlsplit(self.url).scheme.lower() == "ftp":
+            return False
+        try:
+            from .hls import is_hls
+            if is_hls(self.url):
+                return False
+        except Exception:
+            pass
         try:
             from .fallback import curl_cffi_download
             import curl_cffi
@@ -677,6 +748,10 @@ class Task:
         if "异常小的响应" in err or "拒绝访问" in err:
             return ("镜像站拒绝了本机访问（返回空响应或极少数据）：IP / 网络被限流或封禁，"
                     "请换一个镜像站或换网络（如手机热点）")
+        m = re.search(r"HTTP (5\d\d)", err or "")
+        if m:
+            return (f"服务器错误（HTTP {m.group(1)}）：站点可能临时故障或限制下载，"
+                    "稍后重试或换个镜像/线路")
         netish = any(k in low for k in (
             "403", "407", "连接失败", "空响应", "timed out", "timeout", "eof",
             "reset", "ssl", "urlopen", "10060", "10054", "connection", "aborted"))
@@ -687,6 +762,13 @@ class Task:
     def _finalize(self):
         self.message = "正在校验..."
         self.speed = 0.0
+        # 完整性校验：不能用「文件大小 == size」判断 —— _preallocate 已经把 part
+        # truncate 到 size，大小恒等于 size，零填充的残缺文件也能通过。
+        # 正确判据是每个分块的写游标是否真的走过了 end。
+        if self.size > 0:
+            bad = [c for c in self.chunks if c.end >= 0 and c.pos <= c.end]
+            if bad:
+                raise IOError("文件不完整（%d 个分块未写完），已保留进度以便续传" % len(bad))
         # 无合并步骤：part 已经是完整文件，直接改名
         if os.path.exists(self.target):
             try:
@@ -750,10 +832,16 @@ class Task:
 
     def _dispatch(self, limiter, on_change):
         errors: list[str] = []
+        tries: dict[int, int] = {}     # id(chunk) -> 已失败次数
+        fatal = threading.Event()      # 某块重试超限 → 整体停下，避免无限重试
 
         for attempt in range(3):
             pending = [c for c in self.chunks if not c.done and c.remaining > 0]
-            if not pending or self.stop.is_set() or self.pause.is_set():
+            if self.stop.is_set() or self.pause.is_set():
+                if self.pause.is_set() and not self.stop.is_set():
+                    errors.append("paused")     # 暂停退出：不能让 run() 误判成失败去走兜底
+                break
+            if not pending:
                 break
 
             self._conns = []
@@ -762,7 +850,8 @@ class Task:
 
             def worker():
                 """一个 worker 反复领活，直到没活可干。"""
-                while not stop_flag.is_set() and not pause_flag.is_set():
+                while (not stop_flag.is_set() and not pause_flag.is_set()
+                       and not fatal.is_set()):
                     chunk = self._claim_next()
                     if chunk is None:
                         chunk = self._steal_split()
@@ -771,6 +860,7 @@ class Task:
                     conn = Conn(self, chunk)
                     with self._lock:
                         self._conns.append(conn)
+                    backoff = 0.0
                     try:
                         conn.run(stop_flag, pause_flag, limiter, self._add)
                         chunk.done = True
@@ -782,6 +872,14 @@ class Task:
                     except Exception as e:
                         chunk.error = f"{type(e).__name__}: {e}"
                         errors.append(chunk.error)
+                        # 失败计数 + 指数退避：旧版失败后立刻被重新认领，
+                        # 实测对持续 5xx 的服务器 12 秒发了 14989 个请求（1249 req/s）
+                        n = tries.get(id(chunk), 0) + 1
+                        tries[id(chunk)] = n
+                        if n >= CHUNK_MAX_TRIES:
+                            fatal.set()
+                        else:
+                            backoff = min(3.0, 0.3 * (2 ** (n - 1)))
                     finally:
                         self._release(chunk)
                         with self._lock:
@@ -789,6 +887,11 @@ class Task:
                                 self._conns.remove(conn)
                             except ValueError:
                                 pass
+                    if backoff:                   # 可中断退避
+                        end = time.monotonic() + backoff
+                        while (time.monotonic() < end
+                               and not stop_flag.is_set() and not pause_flag.is_set()):
+                            time.sleep(0.1)
 
             threads = [threading.Thread(target=worker, daemon=True)
                        for _ in range(max(1, self.max_conn))]
@@ -797,6 +900,8 @@ class Task:
 
             while True:
                 if self.stop.is_set() or self.pause.is_set():
+                    if self.pause.is_set() and not self.stop.is_set():
+                        errors.append("paused")
                     break
                 if not any(t.is_alive() for t in threads):
                     break
@@ -809,6 +914,9 @@ class Task:
 
             self._save_meta()
             if all(c.done for c in self.chunks):
+                break
+            if fatal.is_set():
+                errors.append(f"分块重试超过上限（{CHUNK_MAX_TRIES} 次）")
                 break
             if self.stop.is_set() or self.pause.is_set() or "no-range" in errors:
                 break
@@ -824,9 +932,7 @@ class Task:
         self.supports_range = False
         self._drop_progress()
         os.makedirs(os.path.dirname(os.path.abspath(self.target)) or ".", exist_ok=True)
-        with open(self.part_path, "wb") as f:
-            if self.size:
-                f.truncate(self.size)
+        self._preallocate(self.part_path)
         self.chunks = [Chunk(0, 0, self.size - 1 if self.size > 0 else -1)]
         self.downloaded = 0
         self._bytes = 0

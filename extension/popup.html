@@ -32,13 +32,15 @@
 <button class="primary" id="dl">下载当前标签页</button>
 <button id="ui">打开下载器界面</button>
 
-<div class="hint">需要先启动 MultiDL（run.py 或 start.bat）。接管时浏览器原生下载会被取消。</div>
+<div class="hint" id="hint">需要先启动 MultiDL（run.py 或 start.bat）。接管时浏览器原生下载会被取消。</div>
 
 <script>
 const $ = s => document.querySelector(s);
 const load = async () => {
-  const c = await chrome.storage.local.get({ port: 8765, enabled: true });
+  const c = await chrome.storage.local.get({ port: 8765, enabled: true, lastError: "" });
   $('#port').value = c.port; $('#enabled').checked = c.enabled;
+  // 把最近一次投递失败显示出来，否则线上 403 完全没法定位
+  if (c.lastError) $('#hint').textContent = "上次失败：" + c.lastError;
   ping();
 };
 const ping = () => chrome.runtime.sendMessage({ type: "ping" }, r => {
@@ -55,9 +57,15 @@ $('#enabled').onchange = () => {
 $('#ui').onclick = () => chrome.runtime.sendMessage({ type: "openUI" });
 $('#dl').onclick = async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) return;
+  if (!tab || !tab.url) {
+    $('#st').textContent = "此页面不可下载";
+    setTimeout(ping, 1800);
+    return;
+  }
   chrome.runtime.sendMessage({ type: "add", payload: { url: tab.url } }, r => {
-    $('#st').textContent = r && r.ok ? "已加入" : "失败";
+    const ok = r && r.ok;
+    $('#st').textContent = ok ? "已加入" : "失败";
+    if (!ok && r && r.error) $('#hint').textContent = r.error;
     setTimeout(ping, 1500);
   });
 };

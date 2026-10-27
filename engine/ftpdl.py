@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+import shutil
 import ftplib
 import urllib.parse as up
 
@@ -46,7 +47,7 @@ def ftp_download(sess, limiter, on_change):
                 if sess.stop.is_set():
                     raise RuntimeError("__abort__")
                 time.sleep(0.2)
-            limiter.consume(len(block), should_stop=sess.stop.is_set)
+            limiter.consume(len(block), stop=sess.stop.is_set)
             f.write(block)
             got += len(block)
             sess.downloaded = got
@@ -86,3 +87,4 @@ def ftp_download(sess, limiter, on_change):
     sess.finished = time.time()
     sess.speed = 0.0
     on_change(sess)
+    shutil.rmtree(sess.tmpdir, ignore_errors=True)      # 临时 part 已改名，清掉空目录

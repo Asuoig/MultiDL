@@ -43,7 +43,8 @@ def main():
     ap.add_argument("url", nargs="?", default=None)
     a = ap.parse_args()
     log.info("启动参数: dir=%s data=%s conn=%s parallel=%s speed=%s port=%s proxy=%s url=%s",
-             a.dir, a.data, a.conn, a.parallel, a.speed, a.port, a.proxy, a.url)
+             a.dir, a.data, a.conn, a.parallel, a.speed, a.port,
+             diag.mask_proxy(a.proxy), diag.mask_url(a.url))
 
     mgr = Manager(a.data or data_dir, a.dir or dl_dir, max_parallel=a.parallel,
                   speed_limit=a.speed * 1024, default_conn=a.conn)
@@ -73,7 +74,7 @@ def main():
         try:
             mgr.add(a.url)
         except Exception:
-            log.exception("命令行 URL 添加失败: %s", a.url)
+            log.exception("命令行 URL 添加失败: %s", diag.mask_url(a.url))
 
     app = App(mgr, api_port)
     diag.install(app)                # 接管 tkinter 界面回调里的异常

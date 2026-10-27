@@ -76,7 +76,7 @@ def _sample(url, proxies, want=SAMPLE_BYTES, timeout=SAMPLE_TIMEOUT):
     try:
         from curl_cffi import requests as creq
     except Exception:
-        return None
+        return None, 0, False          # 调用方按三元组解包，不能返回裸 None
     t0 = time.monotonic()
     r = None
     try:

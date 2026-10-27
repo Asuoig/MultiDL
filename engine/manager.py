@@ -11,10 +11,44 @@ import urllib.parse as up
 from .core import Task, SpeedLimiter, DEFAULT_UA
 
 
+ALLOWED_SCHEMES = ("http", "https", "ftp")
+
+
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL",
+                   *(f"COM{i}" for i in range(1, 10)),
+                   *(f"LPT{i}" for i in range(1, 10))}
+
+
 def sanitize(name: str) -> str:
-    for ch in '\\/:*?"<>|':
-        name = name.replace(ch, "_")
-    return name.strip() or "download.bin"
+    """把服务端/用户给的文件名压成安全的单段文件名。
+
+    - 去掉路径分隔符与 Windows 非法字符
+    - 去掉控制字符（含 NUL）、首尾空白与结尾的点（Windows 上 "a." 无法创建）
+    - "." / ".." / 空 / 保留设备名（CON、NUL、COM1…）→ 回退默认名
+    """
+    name = str(name or "")
+    name = "".join(("_" if (ord(c) < 32 or c in '\\/:*?"<>|') else c) for c in name)
+    name = name.strip().strip(".").strip()
+    if not name or name in (".", ".."):
+        return "download.bin"
+    # Windows 保留设备名（不分大小写、带扩展名也生效，如 NUL.txt）
+    if name.split(".")[0].upper() in _RESERVED_NAMES:
+        name = "_" + name
+    return name
+
+
+def inside_dir(root: str, path: str) -> bool:
+    """path 是否位于 root 目录内。
+
+    用 realpath 解析符号链接/目录联接（junction）后再比较 —— 否则下载目录里放一个
+    指向 C:\\Windows 的 junction，就能借道把文件写到目录外。
+    """
+    try:
+        r = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+        p = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        return os.path.commonpath([r, p]) == r
+    except Exception:
+        return False
 
 
 def unique_path(path: str) -> str:
@@ -48,6 +82,43 @@ def _norm_conn(v) -> int:
     return 0 if n <= 0 else max(1, min(n, 32))
 
 
+class _DynSem:
+    """可在线调整并发上限的信号量。
+
+    threading.Semaphore 的计数没法改小，`self._sem = Semaphore(n)` 会让已经
+    拿过旧信号量的线程永远还不到新对象上 → 并发上限实际上失效。这里用条件变量。
+    """
+
+    def __init__(self, n=1):
+        self._limit = max(1, int(n))
+        self._cur = 0
+        self._cv = threading.Condition()
+
+    def set_limit(self, n):
+        with self._cv:
+            self._limit = max(1, int(n))
+            self._cv.notify_all()
+
+    def acquire(self):
+        with self._cv:
+            while self._cur >= self._limit:
+                self._cv.wait()
+            self._cur += 1
+
+    def release(self):
+        with self._cv:
+            self._cur = max(0, self._cur - 1)
+            self._cv.notify()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *a):
+        self.release()
+        return False
+
+
 class Manager:
     def __init__(self, data_dir: str, download_dir: str, max_parallel: int = 3,
                  speed_limit: int = 0, default_conn: int = 0):
@@ -62,7 +133,7 @@ class Manager:
         self.tasks: dict[str, Task] = {}
         self.order: list[str] = []
         self._lock = threading.RLock()
-        self._sem = threading.Semaphore(self.max_parallel)
+        self._sem = _DynSem(self.max_parallel)
         self._save_lock = threading.Lock()
         self._dirty = False
         self._on_change = None
@@ -90,7 +161,7 @@ class Manager:
             self.max_parallel = max(1, int(c.get("max_parallel", self.max_parallel)))
             self.default_conn = _norm_conn(c.get("default_conn", self.default_conn))
             self.limiter.set_bps(int(c.get("speed_limit", 0)))
-            self._sem = threading.Semaphore(self.max_parallel)
+            self._sem = _DynSem(self.max_parallel)
             mode = str(c.get("proxy_mode", "auto")).lower()
             self.proxy_mode = mode if mode in ("auto", "direct", "proxy") else "auto"
             self.proxy_addr = str(c.get("proxy_addr") or "").strip()
@@ -184,6 +255,17 @@ class Manager:
         except Exception:
             pass
 
+    def _write_state(self):
+        with self._save_lock:
+            payload = {"tasks": [self.tasks[i].to_dict() for i in self.order
+                                 if i in self.tasks]}
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.state_file)
+
     def _saver(self):
         while True:
             time.sleep(1.5)
@@ -191,18 +273,18 @@ class Manager:
                 continue
             self._dirty = False
             try:
-                with self._save_lock:
-                    payload = {"tasks": [self.tasks[i].to_dict() for i in self.order
-                                         if i in self.tasks]}
-                    tmp = self.state_file + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False, indent=1)
-                    os.replace(tmp, self.state_file)
+                self._write_state()
             except Exception:
                 pass
 
     def save_now(self):
+        """退出前同步落盘 —— 只置 dirty 标志的话，进程退出时可能还没写进磁盘。"""
         self._dirty = True
+        try:
+            self._write_state()
+            self._dirty = False
+        except Exception:
+            pass
 
     # ---------------- 查询 ----------------
     def snapshots(self):
@@ -219,10 +301,22 @@ class Manager:
         url = (url or "").strip()
         if not url:
             raise ValueError("URL 为空")
-        if not up.urlsplit(url).scheme:
+        u0 = up.urlsplit(url)
+        if not u0.scheme:
             url = "https://" + url
+            u0 = up.urlsplit(url)
+        scheme = (u0.scheme or "").lower()
+        if scheme not in ALLOWED_SCHEMES:
+            raise ValueError(f"不支持的协议：{scheme or '(空)'}（仅支持 http / https / ftp）")
+        if scheme in ("http", "https", "ftp") and not u0.hostname:
+            raise ValueError("URL 缺少主机名")
 
         auto_named = not target
+        if target:
+            # 落盘位置必须在下载目录内：挡住「任意网页让下载器写任意路径」
+            target = os.path.abspath(target)
+            if not inside_dir(self.download_dir, target):
+                raise ValueError("保存路径必须在下载目录内")
         if not target:
             name = filename_hint or self._name_from_url(url)
             target = unique_path(os.path.join(self.download_dir, sanitize(name)))
@@ -230,7 +324,7 @@ class Manager:
         t = Task(url, target, headers=headers or {}, ua=ua or DEFAULT_UA,
                  referer=referer, cookie=cookie,
                  max_conn=max_conn if max_conn is not None else self.default_conn,
-                 filename_hint=filename_hint)
+                 filename_hint=sanitize(filename_hint) if filename_hint else None)
         # 名字是按 URL 猜的 → 探测拿到真实文件名后允许修正
         t._auto_named = auto_named and not filename_hint
         with self._lock:
@@ -253,21 +347,39 @@ class Manager:
     # ---------------- 生命周期 ----------------
     def start(self, tid):
         t = self.get(tid)
-        if not t or t._runner or t.state == "done":
+        if not t or t.state == "done":
             return False
+        # 兜底校验：历史遗留（或被人塞进 tasks.json）的越权路径一律不执行
+        if not inside_dir(self.download_dir, t.target):
+            t.state = "error"
+            t.message = "保存路径不在下载目录内，请重新添加该任务"
+            self._dirty = True
+            self._notify()
+            return False
+        # 幂等：连点两次「开始」不能起两套线程去抢同一个 part 文件
+        with t._lock:
+            if t._started:
+                return False
+            t._started = True
         t.stop.clear()
         t.pause.clear()
         t.state = "queued"
-        threading.Thread(target=self._worker, args=(t,), daemon=True).start()
+        th = threading.Thread(target=self._worker, args=(t,), daemon=True)
+        t._thread = th
+        th.start()
         return True
 
     def _worker(self, t: Task):
-        with self._sem:
-            if t.stop.is_set():
-                return
-            t.run(self.limiter, self._notify)
-            self._dirty = True
-            self._notify()
+        try:
+            with self._sem:
+                if t.stop.is_set():
+                    return
+                t.run(self.limiter, self._notify)
+                self._dirty = True
+                self._notify()
+        finally:
+            with t._lock:
+                t._started = False
 
     def pause(self, tid):
         t = self.get(tid)
@@ -281,8 +393,24 @@ class Manager:
         t = self.get(tid)
         if not t or t.state not in ("paused", "error"):
             return False
-        t.resume_task()
-        return self.start(tid)
+        # 暂停是协作式的：旧线程可能还在收尾。不等它退出就起新线程，
+        # 两套线程会抢同一个 part 文件，进度直接乱掉（旧版就是这样）。
+        th = getattr(t, "_thread", None)
+        if th is not None and th.is_alive():
+            th.join(timeout=3.0)
+            if th.is_alive():
+                return False
+        prev = t.state
+        t.resume_task()                       # 置 running（会清 pause 标志）
+        if not self.start(tid):
+            # 起线程失败 → 回滚状态，别留下「running 但没有线程」的假活任务
+            cur = getattr(t, "_thread", None)
+            if not (cur is not None and cur.is_alive()):
+                t.state = prev if prev in ("paused", "error") else "paused"
+                if t.state == "paused":
+                    t.message = "已暂停"
+            return False
+        return True
 
     def cancel(self, tid):
         t = self.get(tid)
@@ -299,22 +427,35 @@ class Manager:
         if not t:
             return False
         t.cancel()
-        time.sleep(0.2)
-        shutil.rmtree(t.tmpdir, ignore_errors=True)
-        for p in (t.part_path, t.meta_path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-        if delete_file:
-            try:
-                if os.path.exists(t.target):
-                    os.remove(t.target)
-            except Exception:
-                pass
         self._dirty = True
         self._notify()
+
+        def _cleanup():
+            # 等旧线程退出再删，否则 Windows 上句柄未释放会删不掉
+            th = getattr(t, "_thread", None)
+            if th is not None:
+                th.join(timeout=10)
+            # 临时产物也必须在下载目录内才删（防止 target 被指到别处时误删他人文件）
+            if inside_dir(self.download_dir, t.tmpdir):
+                shutil.rmtree(t.tmpdir, ignore_errors=True)
+            for p in (t.part_path, t.meta_path):
+                try:
+                    if inside_dir(self.download_dir, p) and os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            if delete_file and inside_dir(self.download_dir, t.target):
+                try:
+                    if os.path.exists(t.target):
+                        os.remove(t.target)
+                except Exception:
+                    pass
+
+        th = getattr(t, "_thread", None)
+        if th is not None and th.is_alive():
+            threading.Thread(target=_cleanup, daemon=True).start()   # 不阻塞界面线程
+        else:
+            _cleanup()
         return True
 
     def start_all(self):
@@ -332,10 +473,18 @@ class Manager:
     # ---------------- 设置 ----------------
     def set_limits(self, max_parallel=None, speed_limit=None, default_conn=None):
         if max_parallel is not None:
-            self.max_parallel = max(1, int(max_parallel))
-            self._sem = threading.Semaphore(self.max_parallel)
+            try:
+                n = int(max_parallel)
+            except (TypeError, ValueError):
+                raise ValueError("max_parallel 必须是整数")
+            self.max_parallel = max(1, min(n, 32))
+            self._sem.set_limit(self.max_parallel)      # 原地调整，已持锁的线程不受影响
         if speed_limit is not None:
-            self.limiter.set_bps(int(speed_limit))
+            try:
+                bps = int(speed_limit)
+            except (TypeError, ValueError):
+                raise ValueError("speed_limit 必须是整数")
+            self.limiter.set_bps(max(0, bps))
         if default_conn is not None:
             self.default_conn = _norm_conn(default_conn)
         self._dirty = True
