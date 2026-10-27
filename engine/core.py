@@ -165,8 +165,8 @@ class Conn:
             elif t.last_modified:
                 h["If-Range"] = t.last_modified
 
-        # 先按代理连；代理失败则退回直连（保证不会因为代理配错而让下载失败）
-        attempts = (True, False) if proxy_for(host) else (False,)
+        # 按自动选路结果决定；未决定时代理优先、失败退直连
+        attempts = t.proxy_attempts(host)
         conn = resp = None
         for i, use_proxy in enumerate(attempts):
             try:
@@ -283,8 +283,14 @@ class Task:
         self.etag = None
         self.last_modified = None
         self.content_type = None
+        self.content_disposition = None
         self.supports_range = False
         self.chunks: list[Chunk] = []
+
+        # 自动选路结果：None=未决定（按 proxy_for 走），True=走代理，False=只走直连
+        self.use_proxy = None
+        self.route_reason = ""
+        self._auto_named = False        # target 是否是按 URL 自动取的名字（可被最终 URL 修正）
 
         self.state = "queued"
         self.message = ""
@@ -410,7 +416,7 @@ class Task:
             h.setdefault("User-Agent", self.ua or DEFAULT_UA)
             h["Accept-Encoding"] = "identity"
             h["Range"] = "bytes=0-0"
-            attempts = (True, False) if proxy_for(host) else (False,)
+            attempts = self.proxy_attempts(host)
             conn = resp = None
             for i, use_proxy in enumerate(attempts):
                 try:
@@ -443,6 +449,7 @@ class Task:
 
             self.final_url = url
             self.content_type = resp.getheader("Content-Type")
+            self.content_disposition = resp.getheader("Content-Disposition")
             self.etag = resp.getheader("ETag")
             self.last_modified = resp.getheader("Last-Modified")
 
@@ -473,9 +480,86 @@ class Task:
     def guess_name(self):
         if self.filename_hint:
             return self.filename_hint
+        # 优先用服务器给的 Content-Disposition 文件名
+        cd = self.content_disposition or ""
+        if cd:
+            m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", cd, re.I)
+            if m:
+                name = up.unquote(m.group(1).strip())
+                name = re.sub(r'[\\/:*?"<>|]', "_", name)[:150]
+                if name:
+                    return name
+        # 其次用「重定向后的最终 URL」——原始 URL 常常是 /download/latest/win32/x64 这种
         u = up.urlsplit(self.final_url or self.url)
         name = os.path.basename(up.unquote(u.path)) or "download.bin"
         return re.sub(r'[\\/:*?"<>|]', "_", name)[:150]
+
+    def _fix_target_name(self):
+        """探测拿到最终 URL 后，修正自动取的文件名。
+
+        例：https://lmstudio.ai/download/latest/win32/x64 → 原名 "x64"（无扩展名），
+        重定向后是 LM-Studio-0.4.26-4-x64.exe，应改用后者。
+        """
+        if not self._auto_named or not self.target:
+            return
+        cur = os.path.basename(self.target)
+        better = self.guess_name()
+        if not better or better == cur:
+            return
+        if os.path.splitext(cur)[1] or not os.path.splitext(better)[1]:
+            return                       # 当前已有扩展名，或新名字也没扩展名 → 不动
+        try:
+            from .manager import unique_path
+            self.target = unique_path(os.path.join(os.path.dirname(self.target), better))
+        except Exception:
+            self.target = os.path.join(os.path.dirname(self.target), better)
+
+    def proxy_attempts(self, host):
+        """本任务该走哪条路：返回尝试序列（True=走代理）。
+
+        自动选路已决定时按结果走；未决定时退回「系统代理优先、失败退直连」。
+        """
+        if self.use_proxy is True:
+            return (True, False)         # 代理优先，代理挂了再试直连
+        if self.use_proxy is False:
+            return (False,)              # 只走直连
+        return (True, False) if proxy_for(host) else (False,)
+
+    def _auto_route(self, on_change=None):
+        """自动模式：实测「直连」与「代理」，选更快的那条。
+
+        直连不通才用代理；直连能通但代理快 30% 以上，也切代理（很多海外站对国内直连限速）。
+        """
+        try:
+            from .proxy import current_mode
+            if current_mode() != "auto":
+                return
+        except Exception:
+            return
+        try:
+            self.state = "probing"
+            self.message = "自动选路中…"
+            if on_change:
+                on_change(self)
+        except Exception:
+            pass
+        try:
+            from .route import decide
+            use, reason = decide(self.url)
+            self.use_proxy = bool(use)
+            self.route_reason = reason
+            try:
+                import diag
+                diag.get_logger().info("自动选路 %s → %s（%s）", self.url,
+                                       "代理" if use else "直连", reason)
+            except Exception:
+                pass
+        except Exception as e:
+            self.use_proxy = None
+            self.route_reason = f"选路失败，按默认策略：{e}"
+        finally:
+            if self.message == "自动选路中…":
+                self.message = "探测中"
 
     # ---------- 主流程 ----------
     def run(self, limiter: SpeedLimiter, on_change):
@@ -488,9 +572,13 @@ class Task:
             if is_hls(self.url):
                 return hls_download(self, limiter, on_change)
 
+            # 自动模式：先实测直连与代理，选更快的那条（结果按 host 缓存）
+            self._auto_route(on_change)
+
             resumed = self._load_meta()
             if not resumed:
                 self.probe()
+                self._fix_target_name()        # 用重定向后的真实文件名（原始 URL 常没有扩展名）
                 self._drop_progress()          # 清掉旧进度（会清空 chunks）
                 os.makedirs(os.path.dirname(os.path.abspath(self.target)) or ".", exist_ok=True)
                 # 预分配目标大小（稀疏），后续各连接直接定位写

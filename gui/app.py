@@ -791,7 +791,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.18\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.19\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -890,6 +890,10 @@ class App(tk.Tk):
                 self._dl_prev[s["id"]] = (done_bytes, now)
 
             pct = s["percent"]
+            # 探测阶段把具体原因显示出来（如"自动选路中…"），比干巴巴的"探测中"有用
+            state_txt = STATE_TXT.get(s["state"], s["state"])
+            if s["state"] == "probing" and s.get("message"):
+                state_txt = s["message"]
             if s["size"]:
                 remain_txt = human(remain)
             elif s["state"] in ("running", "probing", "paused"):
@@ -906,7 +910,7 @@ class App(tk.Tk):
                 remain_txt,
                 eta_text(remain, s["speed"]) if s["state"] == "running" else "-",
                 f'{s["connections"]}/{s["max_conn"]}' if s["max_conn"] else "自动",
-                STATE_TXT.get(s["state"], s["state"]),
+                state_txt,
                 s["url"],
             )
             tag = STATE_TAG.get(s["state"], "")

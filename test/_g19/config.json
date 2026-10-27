@@ -1,0 +1,9 @@
+{
+ "clipboard_watch": true,
+ "download_dir": "C:\\Users\\Fang\\Downloads\\MultiDL",
+ "max_parallel": 3,
+ "default_conn": 8,
+ "speed_limit": 0,
+ "proxy_mode": "auto",
+ "proxy_addr": ""
+}

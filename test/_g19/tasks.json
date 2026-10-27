@@ -1,0 +1,22 @@
+{
+ "tasks": [
+  {
+   "id": "79040386419",
+   "url": "https://lmstudio.ai/download/latest/win32/x64",
+   "final_url": "https://installers.lmstudio.ai/win32/x64/0.4.26-4/LM-Studio-0.4.26-4-x64.exe",
+   "target": "C:\\Users\\Fang\\Downloads\\MultiDL\\LM-Studio-0.4.26-4-x64.exe",
+   "headers": {},
+   "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+   "max_conn": 8,
+   "filename_hint": null,
+   "size": 618785040,
+   "etag": "\"d6f49cfd60d616fd1b0b5bf151e642de\"",
+   "last_modified": "Thu, 08 Oct 2026 22:56:10 GMT",
+   "content_type": "application/octet-stream",
+   "supports_range": true,
+   "state": "done",
+   "created": 1793079040.3868225,
+   "finished": 1793079266.2432525
+  }
+ ]
+}

@@ -135,6 +135,15 @@ def current_mode():
     return "auto"
 
 
+def system_proxy():
+    """系统里能用的代理 (host, port)；None 表示没有。
+
+    优先 ProxyEnable 打开的那个，其次注册表里存过的（很多客户端关掉开关后地址还在）。
+    """
+    px, _ = _load_system()
+    return px or _load_server_any()
+
+
 def _resolve_force():
     """「代理」模式下的地址解析顺序：系统代理 → 注册表存过的 → 自动探测。"""
     px, _ = _load_system()
@@ -175,8 +184,8 @@ def describe():
         return "代理（未找到可用代理，将直连）"
     px = active_proxy()
     if px:
-        return f"自动（经代理 {px[0]}:{px[1]}）"
-    return "自动（系统未启用代理，将直连）"
+        return f"自动（智能选路：直连 vs {px[0]}:{px[1]}，取更快的）"
+    return "自动（未配置代理，将直连）"
 
 
 def _load_system():

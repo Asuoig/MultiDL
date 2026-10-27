@@ -222,6 +222,7 @@ class Manager:
         if not up.urlsplit(url).scheme:
             url = "https://" + url
 
+        auto_named = not target
         if not target:
             name = filename_hint or self._name_from_url(url)
             target = unique_path(os.path.join(self.download_dir, sanitize(name)))
@@ -230,6 +231,8 @@ class Manager:
                  referer=referer, cookie=cookie,
                  max_conn=max_conn if max_conn is not None else self.default_conn,
                  filename_hint=filename_hint)
+        # 名字是按 URL 猜的 → 探测拿到真实文件名后允许修正
+        t._auto_named = auto_named and not filename_hint
         with self._lock:
             self.tasks[t.id] = t
             self.order.insert(0, t.id)
