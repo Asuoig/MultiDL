@@ -140,7 +140,19 @@ class Manager:
         self._last_notify = 0.0
         self.config_file = os.path.join(self.data_dir, "config.json")
         self.clipboard_watch = True
-        self.proxy_mode = "auto"            # auto | direct | proxy
+from typing import Literal
+
+ALLOWED_MODES: tuple[str, ...] = ("auto", "direct", "proxy", "browser")
+
+
+class Manager:
+    def __init__(self, data_dir: str, dl_dir: str, max_parallel: int, speed_limit: int, default_conn: int):
+        self.data_file = os.path.join(data_dir, "tasks.json")
+        self.download_dir = os.path.abspath(dl_dir)
+        self.max_parallel = min(max(1, max_parallel), 256)
+        self.speed_limiter = SpeedLimiter(speed_limit * 1024) if speed_limit else None
+        # proxy_mode: "auto" | "direct" | "proxy" | "browser"
+        self.proxy_mode = "auto"
         self.proxy_addr = ""                # 自定义代理地址 host:port（可选）
         self._proxy_from_cli = False        # 命令行指定过 --proxy 时，配置不再覆盖
         self._load_config()
@@ -163,7 +175,7 @@ class Manager:
             self.limiter.set_bps(int(c.get("speed_limit", 0)))
             self._sem = _DynSem(self.max_parallel)
             mode = str(c.get("proxy_mode", "auto")).lower()
-            self.proxy_mode = mode if mode in ("auto", "direct", "proxy") else "auto"
+            self.proxy_mode = mode if mode in ALLOWED_MODES else "auto"
             self.proxy_addr = str(c.get("proxy_addr") or "").strip()
         except Exception:
             pass
@@ -176,10 +188,10 @@ class Manager:
                 pass
 
     def _effective_proxy(self):
-        """代理模式下有自定义地址就用它，否则交给 proxy 模块自动解析。"""
+        """代理模式下有自定义地址就用它，否则交给 proxy 模块自动解析。browser 模式禁用所有代理。"""
         if self.proxy_mode == "proxy" and self.proxy_addr:
             return self.proxy_addr
-        return self.proxy_mode
+        return None if self.proxy_mode == "browser" else self.proxy_mode
 
     def _save_config(self):
         try:
@@ -196,9 +208,9 @@ class Manager:
             pass
 
     def set_proxy_mode(self, mode: str):
-        """界面切换网络模式：auto（自动）/ direct（直连）/ proxy（强制代理）。"""
+        """界面切换网络模式：auto（自动）/ direct（直连）/ proxy（强制代理）/ browser（浏览器指纹）。"""
         mode = str(mode or "auto").lower()
-        if mode not in ("auto", "direct", "proxy"):
+        if mode not in ALLOWED_MODES:
             mode = "auto"
         self.proxy_mode = mode
         self._proxy_from_cli = False

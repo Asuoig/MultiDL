@@ -41,9 +41,17 @@ STATE_TAG = {
 }
 
 # 网络模式（界面文案 ↔ 内部值）
-NET_LABELS = {"auto": "自动", "direct": "直连", "proxy": "代理"}
+NET_LABELS = {"auto": "自动", "direct": "直连", "proxy": "代理", "browser": "浏览器指纹（反爬）"}
 NET_MODES = {v: k for k, v in NET_LABELS.items()}
 NET_CUSTOM = "自定义…"
+
+# 网络模式枚举（与 engine 侧保持同步）
+NETWORK_MODES = {
+    "auto": "自动",
+    "direct": "直连",
+    "proxy": "代理",
+    "browser": "浏览器指纹（反爬）",
+}
 
 BAR_FULL = "\u25a0"      # ■ 实心方块
 BAR_EMPTY = "\u25a1"     # □ 空心方块（浅色轨道）

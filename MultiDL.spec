@@ -1,20 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-
-cffi_datas, cffi_bins, cffi_hidden = collect_all('curl_cffi')
-cert_datas, cert_bins, cert_hidden = collect_all('certifi')
 
 
 a = Analysis(
     ['main.py'],
-    pathex=['.'],
-    binaries=cffi_bins + cert_bins,
-    datas=[('assets/icon.ico', 'assets')] + cffi_datas + cert_datas,
-    hiddenimports=cffi_hidden + cert_hidden,
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['numpy', 'PIL', 'unittest', 'pydoc'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
@@ -39,5 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets/icon.ico'],
 )
