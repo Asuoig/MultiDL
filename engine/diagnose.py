@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -22,17 +24,21 @@ CN_SPEED_URLS = [
     ("阿里云", "https://mirrors.aliyun.com/ubuntu-releases/22.04/ubuntu-22.04.5-live-server-amd64.iso"),
     ("中科大", "https://mirrors.ustc.edu.cn/ubuntu-releases/22.04/ubuntu-22.04.5-live-server-amd64.iso"),
 ]
-# 国外测速源（经代理访问）
+# 国外测速源（经代理访问）。多线程测速需要大文件，优先 1GB 的 OVH
 OUT_SPEED_URLS = [
-    ("OVH", "https://proof.ovh.net/files/10Mb.dat"),
-    ("CacheFly", "https://cachefly.cachefly.net/10mb.test"),
-    ("Hetzner", "https://speed.hetzner.de/10MB.bin"),
+    ("OVH", "https://proof.ovh.net/files/1Gb.dat"),
+    ("OVH-100M", "https://proof.ovh.net/files/100Mb.dat"),
+    ("CacheFly", "https://cachefly.cachefly.net/100mb.test"),
 ]
 # 延迟探测目标
 CN_HOSTS = ["mirrors.aliyun.com", "www.baidu.com", "mirrors.tuna.tsinghua.edu.cn"]
 OUT_HOSTS = ["www.gstatic.com", "github.com", "www.cloudflare.com"]
 
-TEST_BYTES = 4 * 1024 * 1024        # 每个测速读 4MB，够算稳定速度又不费流量
+TEST_BYTES = 4 * 1024 * 1024        # 快速模式：每个测速读 4MB
+MT_DURATION = 3.0                   # 精确模式：测速时长（秒）
+MT_WARMUP = 1.0                     # 丢弃前 1 秒（TCP 慢启动阶段，算进去会低估）
+MT_MAX_TOTAL = 400 * 1024 * 1024    # 精确模式最多读 400MB，避免流量失控
+MT_CONNS = 8                        # 默认并发连接数（与下载引擎默认一致）
 
 
 def _log(progress, stage, text, level=None):
@@ -215,8 +221,181 @@ def _try_sources(sources, proxies, progress, stage):
         got, code, bps = _download_speed(url, proxies)
         if got and got >= 512 * 1024:          # 至少拿到 512KB 才算有效
             return {"src": name, "url": url, "mbps": bps / 1048576.0,
-                    "bytes": got, "code": code}
+                    "bytes": got, "code": code, "conns": 1, "precise": False}
         _log(progress, stage, f"  {name} 不可用（HTTP {code}，{got or 0} 字节），换下一个")
+    return None
+
+
+# ---------------- 多线程精确测速 ----------------
+class _Counter:
+    __slots__ = ("n", "_lock")
+
+    def __init__(self):
+        self.n = 0
+        self._lock = threading.Lock()
+
+    def add(self, k):
+        with self._lock:
+            self.n += k
+
+    def get(self):
+        with self._lock:
+            return self.n
+
+
+def _probe_range(url, proxies, timeout=8):
+    """返回 (文件大小, 是否支持 Range)。"""
+    try:
+        from curl_cffi import requests as creq
+    except Exception:
+        return 0, False
+    try:
+        r = creq.get(url, impersonate="chrome", proxies=proxies, timeout=timeout,
+                     headers={"Range": "bytes=0-0"})
+        cr = r.headers.get("Content-Range") or ""
+        cl = (r.headers.get("Content-Length") or "").strip()
+        r.close()
+        m = re.search(r"/(\d+)$", cr)
+        if m:
+            return int(m.group(1)), True
+        return (int(cl) if cl.isdigit() else 0), False
+    except Exception:
+        return 0, False
+
+
+def _mt_worker(url, start, end, proxies, counter, stop, cap):
+    """一个连接负责 [start, end] 区间，读到结束或被叫停。"""
+    try:
+        from curl_cffi import requests as creq
+    except Exception:
+        return
+    got = 0
+    r = None
+    try:
+        r = creq.get(url, impersonate="chrome", proxies=proxies, stream=True, timeout=15,
+                     headers={"Range": f"bytes={start}-{end}"})
+        if r.status_code not in (200, 206):
+            return
+        for chunk in r.iter_content(131072):
+            if stop.is_set():
+                break
+            counter.add(len(chunk))
+            got += len(chunk)
+            if cap and got >= cap:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            if r is not None:
+                r.close()
+        except Exception:
+            pass
+
+
+def multithread_speed(url, proxies=None, conns=MT_CONNS, duration=MT_DURATION,
+                      warmup=MT_WARMUP, max_total=MT_MAX_TOTAL, on_tick=None):
+    """多连接并行测速，返回稳态速度（MB/s）。
+
+    为什么比单线程准：
+      1. 多连接绕开 TCP 拥塞窗口和服务器单连接限速
+      2. 用固定时间窗口，而不是固定字节数（小文件测不出高带宽）
+      3. 丢弃前 warmup 秒，避开 TCP 慢启动的低速阶段
+      4. 只在稳态区间内做「字节增量 ÷ 时间」，不受启动瞬间影响
+    """
+    size, ranged = _probe_range(url, proxies)
+    if not ranged or size <= 0:
+        # 不支持分段 → 只能单线程
+        got, code, bps = _download_speed(url, proxies, want=TEST_BYTES)
+        if not got:
+            return None
+        return {"url": url, "mbps": bps / 1048576.0, "bytes": got, "code": code,
+                "conns": 1, "precise": False, "size": size, "ranged": False}
+
+    conns = max(1, min(int(conns), 16))
+    per = max(1, size // conns)
+    cap = max(1, max_total // conns)
+
+    counter = _Counter()
+    stop = threading.Event()
+    threads = []
+    for i in range(conns):
+        a = i * per
+        b = (size - 1) if i == conns - 1 else (a + per - 1)
+        t = threading.Thread(target=_mt_worker,
+                             args=(url, a, b, proxies, counter, stop, cap), daemon=True)
+        t.start()
+        threads.append(t)
+
+    samples = []
+    t0 = time.monotonic()
+    while True:
+        el = time.monotonic() - t0
+        samples.append((el, counter.get()))
+        if on_tick:
+            try:
+                on_tick(el, samples[-1][1])
+            except Exception:
+                pass
+        if el >= duration:
+            break
+        time.sleep(0.1)
+
+    stop.set()
+    for t in threads:
+        t.join(timeout=3)
+
+    total = counter.get()
+    if total < 256 * 1024:                 # 几乎没数据 → 视为失败
+        return None
+
+    # 稳态窗口：丢弃 warmup 之前的采样点
+    pts = [(t, v) for t, v in samples if t >= warmup]
+    if len(pts) >= 2 and (pts[-1][0] - pts[0][0]) > 0.2:
+        dt = pts[-1][0] - pts[0][0]
+        dv = pts[-1][1] - pts[0][1]
+        steady = dv / dt if dt > 0 else total / max(duration, 0.01)
+    else:
+        steady = total / max(duration, 0.01)
+
+    # 峰值：滑动 1 秒窗口内的最大吞吐。
+    # 带宽上限要看峰值 —— 中途卡一下会把平均值拉低，但线路能力没变。
+    peak = steady
+    j = 0
+    for i in range(len(samples)):
+        while samples[i][0] - samples[j][0] > 1.0:
+            j += 1
+        span = samples[i][0] - samples[j][0]
+        if span >= 0.9:
+            peak = max(peak, (samples[i][1] - samples[j][1]) / span)
+
+    return {"url": url, "mbps": steady / 1048576.0, "peak_mbps": peak / 1048576.0,
+            "bytes": total,
+            "avg_mbps": total / max(duration, 0.01) / 1048576.0,
+            "conns": conns, "precise": True, "size": size, "ranged": True,
+            "duration": duration}
+
+
+def _try_sources_mt(sources, proxies, progress, stage, conns=MT_CONNS):
+    """多线程模式：依次尝试测速源，实时报告速度。"""
+    for name, url in sources:
+        _log(progress, stage, f"测速中：{name}（{conns} 连接并行）…")
+        state = {"last": -1.0}
+
+        def tick(el, total, _name=name, _st=state):
+            # 前 0.8 秒是 TCP 慢启动，报速度没意义；之后每 1.5 秒报一次
+            if el < 0.8:
+                return
+            if el - _st["last"] >= 1.5:
+                _st["last"] = el
+                _log(progress, stage,
+                     f"  {_name} 实时 {total / 1048576 / max(el, 0.1):.1f} MB/s")
+
+        res = multithread_speed(url, proxies, conns=conns, on_tick=tick)
+        if res:
+            res["src"] = name
+            return res
+        _log(progress, stage, f"  {name} 不可用，换下一个")
     return None
 
 
@@ -268,25 +447,37 @@ def verdicts(res):
     px_sp = px.get("mbps") or 0
     cn_rtt = cn.get("rtt_ms")
 
-    # 国内直连绝对水平（单线程测速本来就跑不满千兆/2.5G，所以按绝对值判断更准）
+    # 国内直连绝对水平（上限看峰值：中途卡顿不该被当成带宽不够）
+    cn_conns = cn.get("conns") or 1
+    cn_precise = cn.get("precise")
+    cn_mode = f"{cn_conns} 连接并行" if cn_precise else "单线程"
+    cn_peak = cn.get("peak_mbps") or cn_sp
+    judge = max(cn_sp, cn_peak)
+    peak_txt = f"，峰值 {cn_peak:.1f}" if cn_peak > cn_sp * 1.15 else ""
     if cn_sp:
-        if cn_sp < 3:
-            out.append(f"国内直连只有 {cn_sp:.1f} MB/s，偏慢 —— 可能测速源单线程限速，"
-                       "也可能宽带/线路有问题，可以换多个源再确认。")
-        elif cn_sp < 10:
-            out.append(f"国内直连 {cn_sp:.1f} MB/s，属于单线程正常水平。")
+        if judge < 3:
+            out.append(f"国内直连只有 {cn_sp:.1f} MB/s（{cn_mode}），偏慢 —— "
+                       "测速源限速、宽带或线路都可能有问题，可以换多个源再确认。")
+        elif judge < 10:
+            out.append(f"国内直连 {cn_sp:.1f} MB/s{peak_txt}（{cn_mode}），属于正常水平。")
         else:
-            out.append(f"国内直连 {cn_sp:.1f} MB/s，线路很好。")
+            out.append(f"国内直连 {cn_sp:.1f} MB/s{peak_txt}（{cn_mode}），线路很好。")
 
-    # 链路速率只作参考：单线程测速受服务器限速影响，不能直接当宽带上限
+    # 链路速率对比：多线程才可能跑满链路，单线程跑不满是正常的
     if link and cn_sp:
         link_mb = link / 8.0
-        if cn_sp >= link_mb * 0.6:
-            out.append(f"已接近网卡链路上限（{link:.0f} Mbps ≈ {link_mb:.0f} MB/s）。")
+        ratio = judge / link_mb if link_mb else 0
+        if ratio >= 0.6:
+            out.append(f"已达到网卡链路的 {ratio * 100:.0f}%（{link:.0f} Mbps ≈ "
+                       f"{link_mb:.0f} MB/s），带宽基本跑满。")
+        elif cn_precise:
+            out.append(f"网卡链路 {link:.0f} Mbps（≈{link_mb:.0f} MB/s），"
+                       f"{cn_conns} 连接并行只跑到 {ratio * 100:.0f}% —— "
+                       "瓶颈不在本机网卡，而在宽带套餐、测速源或线路。")
         else:
             out.append(f"网卡链路 {link:.0f} Mbps（≈{link_mb:.0f} MB/s），"
-                       f"单线程只跑到 {cn_sp / link_mb * 100:.0f}% —— 单线程跑不满高带宽是正常的，"
-                       "多线程下载会明显更高。")
+                       f"单线程跑到 {ratio * 100:.0f}% —— 单线程跑不满高带宽是正常的，"
+                       "想看真实上限请用「精确模式」。")
 
     # 延迟判断
     if cn_rtt is not None:
@@ -329,8 +520,13 @@ def verdicts(res):
 
 
 # ---------------- 主流程 ----------------
-def run(progress=None):
-    """执行全部检测。progress(stage, text) 用于界面实时输出。"""
+def run(progress=None, precise=True, conns=MT_CONNS):
+    """执行全部检测。
+
+    precise=True 走多连接精确测速（绕开单连接限速、丢弃慢启动、取稳态）；
+    False 走单线程快速测速（流量小但受单连接限制）。
+    progress(stage, text, level) 用于界面实时输出。
+    """
     res = {"link": {}, "proxy": {}, "dns": {}, "cn": {}, "proxy_test": {}, "verdict": []}
 
     # 1) 本机链路
@@ -380,8 +576,10 @@ def run(progress=None):
     else:
         _log(progress, "cn", "  国内延迟全部失败", "warn")
 
-    _log(progress, "cn", "测试国内直连下载速度 …")
-    cn = _try_sources(CN_SPEED_URLS, None, progress, "cn")
+    mode_txt = f"{conns} 连接并行" if precise else "单线程"
+    _log(progress, "cn", f"测试国内直连下载速度（{mode_txt}）…")
+    cn = (_try_sources_mt(CN_SPEED_URLS, None, progress, "cn", conns) if precise
+          else _try_sources(CN_SPEED_URLS, None, progress, "cn"))
     if cn:
         res["cn"].update(cn)
         _log(progress, "cn", f"  {cn['src']} 直连 {cn['mbps']:.2f} MB/s",
@@ -399,9 +597,11 @@ def run(progress=None):
         else:
             _log(progress, "px", "  代理访问国外失败", "warn")
 
-        _log(progress, "px", "测试代理下载速度 …")
+        _log(progress, "px", f"测试代理下载速度（{mode_txt}）…")
         p = f"http://{px[0]}:{px[1]}"
-        out = _try_sources(OUT_SPEED_URLS, {"http": p, "https": p}, progress, "px")
+        out = (_try_sources_mt(OUT_SPEED_URLS, {"http": p, "https": p}, progress, "px", conns)
+               if precise else
+               _try_sources(OUT_SPEED_URLS, {"http": p, "https": p}, progress, "px"))
         if out:
             res["proxy_test"].update(out)
             _log(progress, "px", f"  {out['src']} 经代理 {out['mbps']:.2f} MB/s",

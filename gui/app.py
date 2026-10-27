@@ -290,8 +290,11 @@ class NetDiagDialog(tk.Toplevel):
 
         head = ttk.Frame(self, padding=(14, 12, 14, 6))
         head.pack(fill="x")
-        ttk.Label(head, text="逐级测速，找出慢在哪一段（会消耗约 8 MB 流量）",
+        ttk.Label(head, text="逐级测速，定位慢在哪一段",
                   foreground="#5b6472").pack(side="left")
+        self.precise = tk.BooleanVar(value=True)
+        ttk.Checkbutton(head, text="精确模式（8 连接并行，最多约 400 MB 流量）",
+                        variable=self.precise).pack(side="right")
 
         box = ttk.Frame(self, padding=(14, 0, 14, 0))
         box.pack(fill="both", expand=True)
@@ -344,6 +347,9 @@ class NetDiagDialog(tk.Toplevel):
         self.txt.delete("1.0", "end")
         self.txt.configure(state="disabled")
         self.copy_btn.configure(state="disabled")
+        # tkinter 变量要在主线程读出来，后台线程不能碰
+        self._precise = bool(self.precise.get())
+        self._conns = 8
         self.status.config(text="检测中…")
         self._result = None
         threading.Thread(target=self._work, daemon=True).start()
@@ -352,7 +358,8 @@ class NetDiagDialog(tk.Toplevel):
         try:
             from engine import diagnose
             res = diagnose.run(progress=lambda stage, text, level=None:
-                               self._q.put(("log", (text, level))))
+                               self._q.put(("log", (text, level))),
+                               precise=self._precise, conns=self._conns)
             self._q.put(("done", res))
         except Exception as e:
             self._q.put(("err", f"{type(e).__name__}: {e}"))
@@ -395,11 +402,19 @@ class NetDiagDialog(tk.Toplevel):
         if cn.get("rtt_ms"):
             self._write(f"  国内延迟：{cn['rtt_ms']:.0f} ms（{cn.get('rtt_host','')}）", "stage")
         if cn.get("mbps"):
-            self._write(f"  国内直连：{cn['mbps']:.2f} MB/s（{cn.get('src','')}）", "stage")
+            how = f"{cn.get('conns', 1)} 连接" if cn.get("precise") else "单线程"
+            pk = cn.get("peak_mbps")
+            extra = f"，峰值 {pk:.2f}" if pk and pk > cn["mbps"] * 1.15 else ""
+            self._write(f"  国内直连：{cn['mbps']:.2f} MB/s{extra}"
+                        f"（{cn.get('src','')}，{how}）", "stage")
         if px.get("rtt_ms"):
             self._write(f"  代理延迟：{px['rtt_ms']:.0f} ms", "stage")
         if px.get("mbps"):
-            self._write(f"  代理下载：{px['mbps']:.2f} MB/s（{px.get('src','')}）", "stage")
+            how = f"{px.get('conns', 1)} 连接" if px.get("precise") else "单线程"
+            pk = px.get("peak_mbps")
+            extra = f"，峰值 {pk:.2f}" if pk and pk > px["mbps"] * 1.15 else ""
+            self._write(f"  代理下载：{px['mbps']:.2f} MB/s{extra}"
+                        f"（{px.get('src','')}，{how}）", "stage")
         d = res.get("dns") or {}
         if d.get("cn") or d.get("out"):
             self._write(f"  DNS 解析：国内 {d.get('cn') or 0:.0f} ms / "
@@ -767,7 +782,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.15\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.16\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
