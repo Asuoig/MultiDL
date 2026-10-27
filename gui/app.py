@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import queue
+import threading
 import webbrowser
 import subprocess
 import tkinter as tk
@@ -273,6 +274,153 @@ class OptionsDialog(Dialog):
         self.destroy()
 
 
+class NetDiagDialog(tk.Toplevel):
+    """网络瓶颈排查：本机链路 → 国内直连 → 代理链路，逐级对比定位瓶颈。"""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("网络瓶颈排查")
+        self.geometry("720x520")
+        self.minsize(560, 400)
+        self.configure(bg="#f7f8fa")
+        self.transient(master)
+        self._q = queue.Queue()
+        self._alive = True
+        self._result = None
+
+        head = ttk.Frame(self, padding=(14, 12, 14, 6))
+        head.pack(fill="x")
+        ttk.Label(head, text="逐级测速，找出慢在哪一段（会消耗约 8 MB 流量）",
+                  foreground="#5b6472").pack(side="left")
+
+        box = ttk.Frame(self, padding=(14, 0, 14, 0))
+        box.pack(fill="both", expand=True)
+        self.txt = tk.Text(box, wrap="word", relief="flat", borderwidth=1,
+                           background="#ffffff", padx=10, pady=8,
+                           font=("Microsoft YaHei UI", 9))
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.txt.tag_configure("stage", foreground="#6b7280")
+        self.txt.tag_configure("ok", foreground="#15803d")
+        self.txt.tag_configure("warn", foreground="#b45309")
+        self.txt.tag_configure("err", foreground="#b91c1c")
+        self.txt.tag_configure("title", foreground="#0b1b33",
+                               font=("Microsoft YaHei UI", 10, "bold"))
+        self.txt.tag_configure("verdict", foreground="#0b1b33",
+                               font=("Microsoft YaHei UI", 9))
+        self.txt.configure(state="disabled")
+
+        foot = ttk.Frame(self, padding=(14, 8, 14, 12))
+        foot.pack(fill="x")
+        self.status = ttk.Label(foot, text="准备中…", foreground="#5b6472")
+        self.status.pack(side="left")
+        ttk.Button(foot, text="关闭", width=8, command=self._close).pack(side="right")
+        self.copy_btn = ttk.Button(foot, text="复制结果", width=10,
+                                   command=self._copy, state="disabled")
+        self.copy_btn.pack(side="right", padx=6)
+        ttk.Button(foot, text="重新检测", width=10,
+                   command=self._restart).pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._restart()
+        self.after(120, self._poll)
+
+    # ---------- 输出 ----------
+    def _write(self, text, tag=None):
+        self.txt.configure(state="normal")
+        self.txt.insert("end", text + "\n", tag or ())
+        self.txt.see("end")
+        self.txt.configure(state="disabled")
+
+    def _section(self, title):
+        self._write("")
+        self._write(title, "title")
+
+    # ---------- 流程 ----------
+    def _restart(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
+        self.copy_btn.configure(state="disabled")
+        self.status.config(text="检测中…")
+        self._result = None
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        try:
+            from engine import diagnose
+            res = diagnose.run(progress=lambda stage, text, level=None:
+                               self._q.put(("log", (text, level))))
+            self._q.put(("done", res))
+        except Exception as e:
+            self._q.put(("err", f"{type(e).__name__}: {e}"))
+
+    def _poll(self):
+        if not self._alive:
+            return
+        try:
+            while True:
+                kind, data = self._q.get_nowait()
+                if kind == "log":
+                    text, level = data
+                    if not text:
+                        continue
+                    if text.startswith("  "):
+                        self._write(text, level or "stage")
+                    else:
+                        self._section(text)
+                elif kind == "done":
+                    self._result = data
+                    self._show_verdict(data)
+                    self.status.config(text="检测完成")
+                    self.copy_btn.configure(state="normal")
+                elif kind == "err":
+                    self._write(f"检测失败：{data}", "err")
+                    self.status.config(text="检测失败")
+        except queue.Empty:
+            pass
+        self.after(120, self._poll)
+
+    def _show_verdict(self, res):
+        self._section("瓶颈判断")
+        for v in res.get("verdict") or ["（数据不足，无法判断）"]:
+            self._write("  • " + v, "verdict")
+        self._section("原始数据")
+        li, cn, px = res.get("link") or {}, res.get("cn") or {}, res.get("proxy_test") or {}
+        if li.get("speed_mbps"):
+            self._write(f"  网卡链路：{li.get('name','')} {li['speed_mbps']:.0f} Mbps"
+                        f"（≈{li['speed_mbps']/8:.0f} MB/s）", "stage")
+        if cn.get("rtt_ms"):
+            self._write(f"  国内延迟：{cn['rtt_ms']:.0f} ms（{cn.get('rtt_host','')}）", "stage")
+        if cn.get("mbps"):
+            self._write(f"  国内直连：{cn['mbps']:.2f} MB/s（{cn.get('src','')}）", "stage")
+        if px.get("rtt_ms"):
+            self._write(f"  代理延迟：{px['rtt_ms']:.0f} ms", "stage")
+        if px.get("mbps"):
+            self._write(f"  代理下载：{px['mbps']:.2f} MB/s（{px.get('src','')}）", "stage")
+        d = res.get("dns") or {}
+        if d.get("cn") or d.get("out"):
+            self._write(f"  DNS 解析：国内 {d.get('cn') or 0:.0f} ms / "
+                        f"国外 {d.get('out') or 0:.0f} ms", "stage")
+
+    # ---------- 交互 ----------
+    def _copy(self):
+        if not self._result:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.txt.get("1.0", "end").strip())
+            self.status.config(text="已复制到剪贴板")
+        except Exception:
+            pass
+
+    def _close(self):
+        self._alive = False
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self, mgr, api_port=None):
         super().__init__()
@@ -349,6 +497,8 @@ class App(tk.Tk):
         o = tk.Menu(m, tearoff=0)
         o.add_command(label="选项...", command=self.options)
         o.add_command(label="打开下载目录", command=self.open_dir)
+        o.add_separator()
+        o.add_command(label="网络瓶颈排查...", command=self.net_diag)
         m.add_cascade(label="选项", menu=o)
 
         h = tk.Menu(m, tearoff=0)
@@ -611,10 +761,13 @@ class App(tk.Tk):
         self.mgr.set_clipboard_watch(r["clipboard_watch"])
         self.refresh()
 
+    def net_diag(self):
+        NetDiagDialog(self)
+
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.14\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.15\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",

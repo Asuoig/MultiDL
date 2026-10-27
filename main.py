@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--tray", action="store_true", help="启动后驻留系统托盘，不弹出主窗口")
     ap.add_argument("--proxy", default=None,
                     help="代理 host:port（如 127.0.0.1:7890）；默认读 Windows 系统代理；none=强制直连")
+    ap.add_argument("--diagnose", action="store_true", help="启动后直接打开网络瓶颈排查")
     ap.add_argument("url", nargs="?", default=None)
     a = ap.parse_args()
     log.info("启动参数: dir=%s data=%s conn=%s parallel=%s speed=%s port=%s proxy=%s url=%s",
@@ -76,6 +77,8 @@ def main():
 
     app = App(mgr, api_port)
     diag.install(app)                # 接管 tkinter 界面回调里的异常
+    if a.diagnose:
+        app.after(400, app.net_diag)
     if a.tray:
         app.withdraw()               # 只驻留托盘，不弹主窗口
     app.mainloop()
