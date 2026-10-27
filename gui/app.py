@@ -638,21 +638,39 @@ class App(tk.Tk):
             self.mgr.set_proxy_mode(mode)
         except Exception:
             pass
-        # 浏览器指纹模式：立即检测依赖并反馈，切走时关闭浏览器进程
+        # 浏览器指纹模式：后台线程启动浏览器（首次可能要下载 chromedriver，
+        # 同步启动会把界面卡死十几秒），结果回到主线程弹窗。切走时关闭浏览器进程。
         from engine.browser import get_downloader
         if mode == "browser":
-            ok, why = get_downloader().start()
-            if ok:
-                messagebox.showinfo(
-                    "浏览器指纹模式",
-                    f"浏览器指纹模式已就绪（后端：{why}）。\n"
-                    "该模式下下载将先由真实浏览器过反爬，再用引擎拉取正文。",
-                    parent=self)
-            else:
-                messagebox.showwarning("浏览器指纹模式不可用", why, parent=self)
+            self.status("浏览器指纹模式：正在启动浏览器…", 30)
+            threading.Thread(target=self._start_browser_bg, daemon=True).start()
         else:
             get_downloader().stop()
         self._refresh_net_hint()
+
+    def _start_browser_bg(self):
+        from engine.browser import get_downloader
+        try:
+            ok, why = get_downloader().start()
+        except Exception as e:                     # noqa: BLE001
+            ok, why = False, f"{type(e).__name__}: {e}"
+
+        def done():
+            if ok:
+                self.status("浏览器指纹模式已就绪", 6)
+                messagebox.showinfo(
+                    "浏览器指纹模式",
+                    f"浏览器指纹模式已就绪（后端：{why}）。\n"
+                    "该模式下下载将先由真实浏览器过反爬拿到直链与 Cookie，"
+                    "再由引擎多线程分块下载。",
+                    parent=self)
+            else:
+                self.status("浏览器指纹模式不可用", 6)
+                messagebox.showwarning("浏览器指纹模式不可用", why, parent=self)
+        try:
+            self.after(0, done)
+        except Exception:
+            pass
 
     def _ask_proxy_addr(self):
         """自定义代理地址：输入 host:port。"""
@@ -682,6 +700,10 @@ class App(tk.Tk):
         try:
             from engine.proxy import describe, ensure_detect
             mode = getattr(self.mgr, "proxy_mode", "auto")
+            if mode == "browser":
+                self.net_hint.config(
+                    text="浏览器指纹（反爬）：真实浏览器过反爬后由引擎分块下载")
+                return
             if mode == "proxy":
                 ensure_detect()                # 后台探测常见端口，不阻塞界面
             self.net_hint.config(text=describe())
@@ -826,8 +848,9 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.21\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.23\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
+            "· 浏览器指纹反爬   · 智能选路   · 浏览器扩展接管\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
             parent=self)

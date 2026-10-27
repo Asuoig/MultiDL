@@ -172,17 +172,33 @@ class Manager:
             pass
         # 命令行没显式指定 --proxy 时，用配置里的网络模式
         if not self._proxy_from_cli:
-            try:
-                from .proxy import set_override
-                set_override(self._effective_proxy())
-            except Exception:
-                pass
+            self._apply_network_mode()
 
     def _effective_proxy(self):
-        """代理模式下有自定义地址就用它，否则交给 proxy 模块自动解析。browser 模式禁用所有代理。"""
+        """代理模式下有自定义地址就用它，否则交给 proxy 模块自动解析。
+
+        browser 模式必须返回 "none"（强制直连），不能返回 None ——
+        set_override(None) 的语义是「自动读系统代理」，那样浏览器指纹模式
+        反而会走代理（且与浏览器会话的 IP 不一致，反爬更容易失败）。
+        """
         if self.proxy_mode == "proxy" and self.proxy_addr:
             return self.proxy_addr
-        return None if self.proxy_mode == "browser" else self.proxy_mode
+        if self.proxy_mode == "browser":
+            return "none"
+        return self.proxy_mode
+
+    def _apply_network_mode(self):
+        """把网络模式同步给 proxy（代理/直连）与 browser（是否接管下载）。"""
+        try:
+            from .proxy import set_override
+            set_override(self._effective_proxy())
+        except Exception:
+            pass
+        try:
+            from . import browser
+            browser.set_enabled(self.proxy_mode == "browser")
+        except Exception:
+            pass
 
     def _save_config(self):
         try:
@@ -205,11 +221,7 @@ class Manager:
             mode = "auto"
         self.proxy_mode = mode
         self._proxy_from_cli = False
-        try:
-            from .proxy import set_override
-            set_override(self._effective_proxy())
-        except Exception:
-            pass
+        self._apply_network_mode()
         self._save_config()
 
     def set_proxy_addr(self, addr: str):
@@ -217,11 +229,7 @@ class Manager:
         self.proxy_addr = (addr or "").strip()
         self.proxy_mode = "proxy" if self.proxy_addr else self.proxy_mode
         self._proxy_from_cli = False
-        try:
-            from .proxy import set_override
-            set_override(self._effective_proxy())
-        except Exception:
-            pass
+        self._apply_network_mode()
         self._save_config()
 
     def set_clipboard_watch(self, on: bool):

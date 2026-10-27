@@ -292,6 +292,9 @@ class Task:
                  cookie=None, max_conn=8, task_id=None, filename_hint=None):
         self.id = task_id or _new_task_id(url)
         self.url = url
+        # 原始 URL：浏览器指纹模式会把 self.url 换成浏览器解析出的真实直链，
+        # 断点续传的身份判定（meta 里的 url）必须始终用原始 URL，否则续传永远对不上。
+        self.origin_url = url
         self.final_url = None
         self.target = target
         self.headers = dict(headers or {})
@@ -354,7 +357,9 @@ class Task:
 
     def to_dict(self):
         return {
-            "id": self.id, "url": self.url, "final_url": self.final_url,
+            "id": self.id, "url": self.url,
+            "origin_url": getattr(self, "origin_url", self.url),
+            "final_url": self.final_url,
             "target": self.target, "headers": self.headers, "ua": self.ua,
             "max_conn": self.max_conn, "filename_hint": self.filename_hint,
             "size": self.size, "etag": self.etag, "last_modified": self.last_modified,
@@ -367,6 +372,7 @@ class Task:
         t = cls(d["url"], d["target"], headers=d.get("headers") or {},
                 ua=d.get("ua"), max_conn=d.get("max_conn", 8),
                 task_id=d.get("id"), filename_hint=d.get("filename_hint"))
+        t.origin_url = d.get("origin_url") or d["url"]
         t.final_url = d.get("final_url")
         t.size = d.get("size", 0)
         t.etag = d.get("etag")
@@ -390,7 +396,7 @@ class Task:
             # （半截 meta 会被 _load_meta 的 except 吞掉 → 退化成"找不到进度"→ 从头下）
             tmp = self.meta_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"url": self.url, "size": self.size, "etag": self.etag,
+                json.dump({"url": getattr(self, "origin_url", self.url), "size": self.size, "etag": self.etag,
                            "lm": self.last_modified,
                            "chunks": [c.d() for c in self.chunks]}, f)
                 f.flush()
@@ -403,7 +409,7 @@ class Task:
         try:
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            if d.get("url") != self.url:
+            if d.get("url") != getattr(self, "origin_url", self.url):
                 return False
             self.size = d.get("size") or 0
             if self.size <= 0:
@@ -646,6 +652,45 @@ class Task:
             if self.message == "自动选路中…":
                 self.message = "探测中"
 
+    def _browser_prepare(self, on_change=None):
+        """浏览器指纹模式：先用真实浏览器过反爬，把真实直链 / Cookie / UA 写回本任务。
+
+        返回 True 表示已接管（之后仍走常规分块下载，多线程能力不受影响）；
+        False 表示不是该模式，或浏览器不可用 / 解析失败 —— 此时按原流程继续，
+        只是把原因记进日志与 message，不影响下载。
+        """
+        try:
+            from .browser import is_enabled, prepare_task
+        except Exception:
+            return False
+        if not is_enabled():
+            return False
+        try:
+            self.state = "probing"
+            self.message = "浏览器指纹准备中…"
+            if on_change:
+                on_change(self)
+        except Exception:
+            pass
+        try:
+            ok, why = prepare_task(self)
+        except Exception as e:                           # noqa: BLE001
+            ok, why = False, f"{type(e).__name__}: {e}"
+        try:
+            import diag
+            log = diag.get_logger()
+            if ok:
+                log.info("浏览器指纹模式：%s（%s）", why, diag.mask_url(self.url))
+            else:
+                log.warning("浏览器指纹模式不可用，改用常规下载：%s", why)
+        except Exception:
+            pass
+        if not ok:
+            self.message = "浏览器指纹不可用，改用常规下载"
+            return False
+        self.route_reason = why
+        return True
+
     # ---------- 主流程 ----------
     def run(self, limiter: SpeedLimiter, on_change):
         try:
@@ -657,8 +702,10 @@ class Task:
             if is_hls(self.url):
                 return hls_download(self, limiter, on_change)
 
-            # 自动模式：先实测直连与代理，选更快的那条（结果按 host 缓存）
-            self._auto_route(on_change)
+            # 浏览器指纹模式：先过反爬拿直链 + Cookie，成功则跳过选路（该模式禁代理）
+            if not self._browser_prepare(on_change):
+                # 自动模式：先实测直连与代理，选更快的那条（结果按 host 缓存）
+                self._auto_route(on_change)
 
             resumed = self._load_meta()
             if not resumed:

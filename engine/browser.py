@@ -183,6 +183,26 @@ class BrowserDownloader:
             pass
         return []
 
+    # ---- 供下载引擎（engine/core.py 的 Task）调用 ----
+    def resolve_url(self, url: str) -> str:
+        """打开页面并尝试解析真实文件直链；解析不到返回原 url。"""
+        return self._resolve(url)
+
+    def cookies_header(self) -> str:
+        """浏览器会话 Cookie 拼成请求头值；无 Cookie 返回空串。"""
+        return "; ".join(self._cookies())
+
+    def user_agent(self) -> str:
+        """浏览器实际使用的 UA（让后续 HTTP 请求与 Cookie 归属保持一致）。"""
+        try:
+            if self.backend == "selenium" and self.driver is not None:
+                return self.driver.execute_script("return navigator.userAgent") or ""
+            if self.backend == "playwright" and self.page is not None:
+                return self.page.evaluate("navigator.userAgent") or ""
+        except Exception:                               # noqa: BLE001
+            pass
+        return ""
+
     def download(self, url: str, save_path: str) -> Tuple[bool, str]:
         """下载文件。返回 (是否成功, 原因)。"""
         if not self.available():
@@ -227,3 +247,45 @@ def get_downloader() -> BrowserDownloader:
     if _downloader is None:
         _downloader = BrowserDownloader()
     return _downloader
+
+
+# ---- 网络模式开关：由 Manager 在切换「浏览器指纹（反爬）」时置位 ----
+# 用独立标志而不是读 proxy 模块，是因为 browser 模式在代理层等价于「直连」，
+# 两者从 proxy.current_mode() 上无法区分。
+_enabled = False
+
+
+def set_enabled(on: bool):
+    global _enabled
+    _enabled = bool(on)
+
+
+def is_enabled() -> bool:
+    return _enabled
+
+
+def prepare_task(task) -> Tuple[bool, str]:
+    """最小接入：用真实浏览器过反爬，把直链 / Cookie / UA 写回 Task。
+
+    只做「准备工作」，正文仍由 Task 的多线程分块流程下载。
+    返回 (是否成功, 说明)；失败时调用方继续走常规 HTTP，不中断下载。
+    """
+    dl = get_downloader()
+    if not dl.available():
+        return False, dl.missing_reason()
+    ok, why = dl.start()
+    if not ok:
+        return False, why
+    url = task.url
+    real = dl.resolve_url(url)
+    if real and real != url:
+        task.url = real
+    cookie = dl.cookies_header()
+    if cookie:
+        task.headers["Cookie"] = cookie
+    ua = dl.user_agent()
+    if ua:
+        task.ua = ua
+        task.headers["User-Agent"] = ua
+    detail = "直链已替换" if real != url else "直链未变（按原地址下载）"
+    return True, f"{why} 后端已就绪，{detail}，Cookie {len(cookie)} 字符"

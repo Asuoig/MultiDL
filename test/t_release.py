@@ -204,6 +204,62 @@ t2 = wait(s2["id"], 25)
 check("持续 5xx 有重试上限（<200 请求且以 error 收尾）",
       t2.state == "error" and CNT["n"] < 200, f"state={t2.state} 请求数={CNT['n']}")
 
+print("\n=== 7. 浏览器指纹模式 ===")
+import engine.browser as browsemod                        # noqa: E402
+from engine.core import Task as _Task                      # noqa: E402
+
+
+class _NoDepsDL:
+    """模拟「依赖未安装」的后端：必须优雅降级，不能中断下载。"""
+    def available(self):
+        return False
+
+    def missing_reason(self):
+        return "stub：依赖未安装"
+
+
+class _FakeDL:
+    """模拟已就绪的后端：验证直链 / Cookie / UA 是否写回任务。"""
+    def available(self):
+        return True
+
+    def start(self):
+        return True, "stub"
+
+    def resolve_url(self, url):
+        return url.replace("/page", "/real.bin")
+
+    def cookies_header(self):
+        return "sid=abc; tok=def"
+
+    def user_agent(self):
+        return "UA-FROM-BROWSER"
+
+
+_orig_dl = browsemod._downloader
+try:
+    browsemod._downloader = _NoDepsDL()
+    mgr.set_proxy_mode("browser")
+    check("browser 模式已通知引擎", browsemod.is_enabled())
+    s3 = mgr.add(f"http://127.0.0.1:{rs.server_address[1]}/big.bin", max_conn=8)
+    t3 = wait(s3["id"])
+    ok3 = (t3.state == "done"
+           and hashlib.sha256(open(t3.target, "rb").read()).hexdigest() == SHA)
+    check("缺依赖时降级为常规下载（不失败）", ok3, f"state={t3.state} msg={t3.message[:40]}")
+
+    browsemod._downloader = _FakeDL()
+    tt = _Task("http://example.com/page", "x.bin")
+    p_ok, p_why = browsemod.prepare_task(tt)
+    check("prepare_task 写回直链 / Cookie / UA",
+          p_ok and tt.url.endswith("/real.bin")
+          and tt.headers.get("Cookie") == "sid=abc; tok=def"
+          and tt.ua == "UA-FROM-BROWSER",
+          f"ok={p_ok} url={tt.url} why={p_why[:40]}")
+finally:
+    browsemod._downloader = _orig_dl
+    mgr.set_proxy_mode("auto")
+    check("切回自动模式后引擎不再走浏览器", not browsemod.is_enabled())
+
 srv.shutdown()
 rs.shutdown()
 bs.shutdown()
