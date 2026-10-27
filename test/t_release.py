@@ -205,8 +205,26 @@ check("持续 5xx 有重试上限（<200 请求且以 error 收尾）",
       t2.state == "error" and CNT["n"] < 200, f"state={t2.state} 请求数={CNT['n']}")
 
 print("\n=== 7. 浏览器指纹模式 ===")
+import subprocess                                          # noqa: E402
 import engine.browser as browsemod                        # noqa: E402
 from engine.core import Task as _Task                      # noqa: E402
+
+# 7.0 打包必备件：内置 chromedriver 必须存在且能跑（否则 exe 里的浏览器模式会退化成下载驱动）
+_drv = browsemod.bundled_driver()
+_drv_ver = ""
+if _drv:
+    try:
+        _drv_ver = subprocess.run([_drv, "--version"], capture_output=True,
+                                  text=True, timeout=20).stdout.strip()
+    except Exception as e:                                 # noqa: BLE001
+        _drv_ver = f"err:{e}"
+check("内置 chromedriver 可用", bool(_drv_ver.startswith("ChromeDriver")),
+      f"{_drv} → {_drv_ver[:40]}")
+
+# 7.0b 本机代理环境变量不能把「连本机 chromedriver」的请求也代理掉（否则全部命令 unhandled request）
+browsemod._bypass_proxy_for_localhost()
+_np = (os.environ.get("NO_PROXY", "") + "," + os.environ.get("no_proxy", "")).lower()
+check("NO_PROXY 已放行本机回环", "127.0.0.1" in _np and "localhost" in _np, _np[:60])
 
 
 class _NoDepsDL:

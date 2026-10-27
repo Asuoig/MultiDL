@@ -1,3 +1,10 @@
 # 可选依赖：反反爬兜底（用 Chrome TLS 指纹重试 403/被墙的站点）。
 # 不装也能正常运行，只是少了这项兜底。
 curl_cffi>=0.7
+
+# 可选依赖：浏览器指纹模式（用真实 Chrome 过 JS 挑战 / WAF）。
+# 官方 exe 已内置 selenium + chromedriver，只有源码运行才需要装：
+#   pip install selenium webdriver-manager
+# chromedriver 也可手动放到 drivers/chromedriver.exe（优先于自动下载）。
+selenium>=4.20
+webdriver-manager>=4.0

@@ -848,7 +848,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.23\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.24\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 浏览器指纹反爬   · 智能选路   · 浏览器扩展接管\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"

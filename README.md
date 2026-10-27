@@ -108,7 +108,9 @@ python test/bench.py
 - ✅ HLS（m3u8，未加密流；加密流明确报错）
 - ✅ 剪贴板监视
 - ✅ 防盗链 Referer / Cookie
-- ✅ **浏览器指纹模式（反爬绕过）**：当 curl_cffi 的 `impersonate="chrome"` 仍被识别为机器人时（如某些镜像站的 JS 反爬、WAF），可启用「选项 → 网络模式 → 浏览器指纹」。程序会启动 Selenium/Playwright 控制的真实 Chrome 进程完成 JS 挑战 / 跳转 / Cookie 颁发，把解析出的**真实直链 + 会话 Cookie + UA** 交给下载引擎，**之后仍走多线程分块下载**（速度不受影响）。依赖缺失时自动降级为常规 HTTP 下载，不会失败。
+- ✅ **浏览器指纹模式（反爬绕过）**：当 curl_cffi 的 `impersonate="chrome"` 仍被识别为机器人时（如某些镜像站的 JS 反爬、WAF），可启用「选项 → 网络模式 → 浏览器指纹」。程序会启动**本机真实 Chrome**（非 headless）完成 JS 挑战 / 跳转 / Cookie 颁发，把解析出的**真实直链 + 会话 Cookie + UA** 交给下载引擎，**之后仍走多线程分块下载**（速度不受影响）。依赖缺失或解析失败时自动降级为常规 HTTP 下载，不会失败。
+  - exe 已内置 selenium 与 chromedriver（无需 pip、无需联网下驱动）；只要本机装了 Chrome 即可用
+  - 不设 `--user-agent`，用真实 Chrome 的 UA + `navigator.webdriver` 抹除，避免「UA 与 Client Hints 不一致」的破绽
 - ✅ 浏览器接管（可选扩展）
 - ✅ 系统托盘常驻（关闭窗口缩到右下角，托盘菜单可暂停 / 继续 / 退出）
 - ✅ 代理支持（默认读 Windows 系统代理，Clash 等自动生效；可 `--proxy` 指定；本地地址直连）

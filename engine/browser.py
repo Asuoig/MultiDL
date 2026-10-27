@@ -2,14 +2,20 @@
 """浏览器指纹模式下载器（反爬绕过）。
 
 当 curl_cffi 的 impersonate="chrome" 仍被识别为机器人时，可切换到此模式：
-启动真实 Chrome / Chromium 进程，先由浏览器完成「JS 挑战 / 跳转 / Cookie 颁发」，
-再用 curl_cffi（带浏览器会话 Cookie + 指纹）拉取正文，避免浏览器内存暴涨。
+启动真实 Chrome 进程，先由浏览器完成「JS 挑战 / 跳转 / Cookie 颁发」，
+再把直链 / Cookie / UA 交给下载引擎（正文仍走多线程分块）。
 
-依赖（均为可选，未安装时本模块会优雅降级并报原因，不会崩溃）：
-    pip install selenium webdriver-manager playwright
-    playwright install chromium
+chromedriver 解析顺序（全部失败才报错）：
+    1. 环境变量 MULTIDL_CHROMEDRIVER / CHROMEDRIVER
+    2. 内置 drivers/chromedriver.exe（打包进 exe，免联网）
+    3. Selenium Manager（selenium 自带，按已装 Chrome 版本自动匹配）
+    4. webdriver_manager（最后兜底，需要联网）
+
+可选依赖（未安装时本模块优雅降级并报原因，不会崩溃）：
+    pip install selenium webdriver-manager
 """
 import os
+import sys
 import random
 import logging
 from typing import Optional, Tuple
@@ -43,6 +49,40 @@ _USER_AGENTS = [
 _FILE_EXTS = (".exe", ".iso", ".zip", ".7z", ".tar.gz", ".tar", ".gz", ".dmg", ".deb", ".rpm")
 
 
+def bundled_driver() -> Optional[str]:
+    """找随程序分发的 chromedriver（打包后在 _MEIPASS/drivers，源码运行在 multidl/drivers）。"""
+    for env in ("MULTIDL_CHROMEDRIVER", "CHROMEDRIVER"):
+        p = os.environ.get(env)
+        if p and os.path.exists(p):
+            return p
+    roots = []
+    base = getattr(sys, "_MEIPASS", None)          # PyInstaller 解包目录
+    if base:
+        roots.append(base)
+    roots.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for r in roots:
+        p = os.path.join(r, "drivers", "chromedriver.exe")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _bypass_proxy_for_localhost():
+    """把 127.0.0.1 / localhost 加进 NO_PROXY。
+
+    Selenium 的 HTTP 客户端走 urllib3，会读 HTTP_PROXY 环境变量；一旦系统里设了代理
+    （Clash / 公司网关 / 沙箱注入），连本机 chromedriver 的请求也会被转发到代理，
+    表现为所有命令都返回 `Message: unhandled request`。这是很隐蔽的坑。
+    """
+    hosts = ("127.0.0.1", "localhost", "::1")
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = [p.strip() for p in os.environ.get(key, "").split(",") if p.strip()]
+        for h in hosts:
+            if h not in parts:
+                parts.append(h)
+        os.environ[key] = ",".join(parts)
+
+
 def _user_data_dir() -> str:
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     d = os.path.join(base, "MultiDL", "pw_profile")
@@ -65,10 +105,9 @@ class BrowserDownloader:
         return HAS_SELENIUM or HAS_PLAYWRIGHT
 
     def missing_reason(self) -> str:
-        return ("未安装浏览器指纹依赖。请先执行：\n"
-                "  pip install selenium webdriver-manager playwright\n"
-                "  playwright install chromium\n"
-                "安装后即可在「选项 → 网络模式」启用「浏览器指纹（反爬）」。")
+        return ("缺少浏览器指纹依赖（selenium）。官方 exe 已内置，源码运行请执行：\n"
+                "  pip install selenium webdriver-manager\n"
+                "并确认本机已安装 Chrome / Edge。")
 
     # ---- 生命周期 ----
     def start(self) -> Tuple[bool, str]:
@@ -77,15 +116,19 @@ class BrowserDownloader:
             return False, self.missing_reason()
         if self.backend is not None:
             return True, self.backend
-        # 优先 Selenium（headless=False 模拟真人），失败回退 Playwright
+        _bypass_proxy_for_localhost()
+        # 优先 Selenium（非 headless，用本机真实 Chrome），失败回退 Playwright
+        err = None
         if HAS_SELENIUM:
             try:
                 self._start_selenium()
+                self._stealth()
                 self.backend = "selenium"
                 logger.info("浏览器指纹模式：Selenium 后端已启动")
                 return True, "selenium"
             except Exception as e:                       # noqa: BLE001
-                logger.warning("Selenium 启动失败，回退 Playwright：%s", e)
+                err = e
+                logger.warning("Selenium 启动失败，尝试 Playwright：%s", e)
                 self._close()
         if HAS_PLAYWRIGHT:
             try:
@@ -97,6 +140,8 @@ class BrowserDownloader:
                 logger.exception("Playwright 启动失败：%s", e)
                 self._close()
                 return False, f"Playwright 启动失败：{e}"
+        if err is not None:
+            return False, f"Chrome 启动失败：{err}"
         return False, "无可用浏览器后端"
 
     def _start_selenium(self):
@@ -105,11 +150,51 @@ class BrowserDownloader:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
-        options.add_argument(f"user-agent={random.choice(_USER_AGENTS)}")
+        # 注意：不要设 --user-agent。真实 Chrome 的 UA 才是最可信的指纹，
+        # 硬编码一个旧版本 UA 反而制造「UA 与 Client Hints / TLS 不一致」的破绽。
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        service = ChromeService(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=options)
+
+        last = None
+        # 1) 内置 chromedriver（免联网，最快）
+        path = bundled_driver()
+        if path:
+            try:
+                self.driver = webdriver.Chrome(
+                    service=ChromeService(executable_path=path), options=options)
+                logger.info("使用内置 chromedriver：%s", path)
+                return
+            except Exception as e:                   # noqa: BLE001
+                last = e
+                logger.warning("内置 chromedriver 启动失败（可能与本机 Chrome 版本不匹配）：%s", e)
+        # 2) Selenium Manager：按已装 Chrome 自动匹配驱动
+        try:
+            self.driver = webdriver.Chrome(options=options)
+            logger.info("使用 Selenium Manager 自动匹配的 chromedriver")
+            return
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            logger.warning("Selenium Manager 启动失败：%s", e)
+        # 3) webdriver_manager 兜底（需联网）
+        try:
+            service = ChromeService(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+            logger.info("使用 webdriver_manager 下载的 chromedriver")
+            return
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            logger.warning("webdriver_manager 启动失败：%s", e)
+        raise RuntimeError(f"无法启动 Chrome：{last}")
+
+    def _stealth(self):
+        """抹掉最容易被检测的 navigator.webdriver（CDP 注入，对所有页面生效）。"""
+        try:
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator,'webdriver',"
+                          "{get:()=>undefined});"
+            })
+        except Exception as e:                       # noqa: BLE001
+            logger.debug("stealth 注入失败（不影响使用）：%s", e)
 
     def _start_playwright(self):
         # 手动管理生命周期（不能用 with 块，否则退出即关闭）
