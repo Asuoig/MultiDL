@@ -41,13 +41,15 @@ def main():
                     help="代理 host:port（如 127.0.0.1:7890）；默认读 Windows 系统代理；none=强制直连")
     ap.add_argument("url", nargs="?", default=None)
     a = ap.parse_args()
-    from engine.proxy import set_override
-    set_override(a.proxy)
     log.info("启动参数: dir=%s data=%s conn=%s parallel=%s speed=%s port=%s proxy=%s url=%s",
              a.dir, a.data, a.conn, a.parallel, a.speed, a.port, a.proxy, a.url)
 
     mgr = Manager(a.data or data_dir, a.dir or dl_dir, max_parallel=a.parallel,
                   speed_limit=a.speed * 1024, default_conn=a.conn)
+    if a.proxy is not None:        # 命令行显式指定 → 优先于配置里的网络模式
+        from engine.proxy import set_override
+        mgr._proxy_from_cli = True
+        set_override(a.proxy)
     if a.dir:                      # 命令行显式指定 → 覆盖配置文件里的目录
         mgr.set_download_dir(a.dir)
     if a.conn != 0 or a.parallel != 3 or a.speed != 0:

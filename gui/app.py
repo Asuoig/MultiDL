@@ -38,6 +38,10 @@ STATE_TAG = {
     "done": "ok", "error": "err", "canceled": "err",
 }
 
+# 网络模式（界面文案 ↔ 内部值）
+NET_LABELS = {"auto": "自动", "direct": "直连", "proxy": "代理"}
+NET_MODES = {v: k for k, v in NET_LABELS.items()}
+
 BAR_FULL = "\u25a0"      # ■ 实心方块
 BAR_EMPTY = "\u25a1"     # □ 空心方块（浅色轨道）
 
@@ -277,6 +281,7 @@ class App(tk.Tk):
         self._last_total_speed = 0.0
         self._speed_hist = {}                  # tid -> deque[float]（速度曲线数据）
         self._dl_prev = {}                     # tid -> (已下载字节, 时间戳)，用来算瞬时速度
+        self._net_hint_at = 0.0
         self._tray = None
 
         self.title(APP_TITLE)
@@ -426,6 +431,33 @@ class App(tk.Tk):
             ttk.Label(s, text=f"浏览器扩展端口 {self.api_port}",
                       background="#eef1f5", foreground="#8a93a0").pack(side="right", padx=14)
 
+        # ---- 网络模式选择：自动 / 直连 / 代理（默认自动，选择会持久化） ----
+        ttk.Label(s, text="网络", background="#eef1f5").pack(side="left", padx=(16, 5))
+        self.net_box = ttk.Combobox(s, values=list(NET_LABELS.values()),
+                                    width=5, state="readonly")
+        self.net_box.set(NET_LABELS.get(self.mgr.proxy_mode, "自动"))
+        self.net_box.bind("<<ComboboxSelected>>", self._on_net_mode)
+        self.net_box.pack(side="left")
+        self.net_hint = ttk.Label(s, text="", background="#eef1f5", foreground="#8a93a0")
+        self.net_hint.pack(side="left", padx=(8, 0))
+        self._refresh_net_hint()
+
+    # ---------------- 网络模式 ----------------
+    def _on_net_mode(self, _ev=None):
+        mode = NET_MODES.get(self.net_box.get(), "auto")
+        try:
+            self.mgr.set_proxy_mode(mode)
+        except Exception:
+            pass
+        self._refresh_net_hint()
+
+    def _refresh_net_hint(self):
+        try:
+            from engine.proxy import describe
+            self.net_hint.config(text=describe())
+        except Exception:
+            self.net_hint.config(text="")
+
     # ---------------- 交互 ----------------
     def selected_ids(self):
         return list(self.tree.selection())
@@ -549,7 +581,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.12\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.13\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
@@ -698,6 +730,10 @@ class App(tk.Tk):
         self.st_right.config(text=tail)
         self.title(f"{APP_TITLE}  —  {human_speed(total_speed)}" if total_speed
                    else APP_TITLE)
+        # 系统代理可能被外部改动，隔几秒刷新一次提示
+        if now - self._net_hint_at > 3:
+            self._net_hint_at = now
+            self._refresh_net_hint()
         if self._tray:
             try:
                 self._tray.set_tooltip(f"MultiDL — {human_speed(total_speed)}" if total_speed

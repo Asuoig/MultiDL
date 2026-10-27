@@ -13,7 +13,7 @@ import sys
 import time
 import fnmatch
 
-_override = None                                  # (host, port) | "none" | None
+_override = None                                  # (host, port) | "none" | "force" | None
 _cache = {"at": 0.0, "proxy": None, "bypass": ""}
 _CACHE_TTL = 5.0
 
@@ -39,16 +39,61 @@ def _parse(s):
 
 
 def set_override(value):
-    """main.py 解析 --proxy 后调用。"""
+    """main.py 解析 --proxy 后调用；也用于界面切换网络模式。
+
+    取值：None / "auto"=自动读系统代理；"none"/"direct"=强制直连；
+          "force"/"proxy"=强制走系统代理（忽略绕过列表）；host:port=指定代理。
+    """
     global _override
     if value is None:
         _override = None
         return
     v = str(value).strip()
-    if v.lower() in ("", "none", "off", "0", "direct", "no"):
+    low = v.lower()
+    if low in ("", "auto", "system"):
+        _override = None
+    elif low in ("none", "off", "0", "direct", "no"):
         _override = "none"
+    elif low in ("force", "proxy", "on", "always"):
+        _override = "force"
     else:
         _override = _parse(v)
+
+
+def current_mode():
+    """当前模式：'direct' | 'proxy' | 'auto'。"""
+    if _override == "none":
+        return "direct"
+    if _override == "force" or _override:
+        return "proxy"
+    return "auto"
+
+
+def active_proxy():
+    """对一般外网地址实际会使用的代理 (host, port)；None 表示直连。"""
+    if _override == "none":
+        return None
+    if _override == "force":
+        px, _ = _load_system()
+        return px or _load_server_any()
+    if _override:
+        return _override
+    px, _ = _load_system()
+    return px
+
+
+def describe():
+    """给界面显示的一句话说明。"""
+    mode = current_mode()
+    if mode == "direct":
+        return "直连（不走代理）"
+    px = active_proxy()
+    if px:
+        tag = "（强制）" if (mode == "proxy" and _override == "force") else ""
+        return f"代理 {px[0]}:{px[1]}{tag}"
+    if mode == "proxy":
+        return "代理（未找到代理地址，将直连）"
+    return "自动（系统未启用代理，将直连）"
 
 
 def _load_system():
@@ -89,6 +134,33 @@ def _load_system():
     return proxy, bypass
 
 
+def _load_server_any():
+    """不管 ProxyEnable 开关，只要注册表里存过代理地址就取出来。
+
+    用户手动选「代理」时应该尊重这个地址 —— 很多人关掉系统代理开关后，
+    Clash 的 127.0.0.1:7890 仍留在注册表里。
+    """
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        try:
+            server = winreg.QueryValueEx(k, "ProxyServer")[0] or ""
+        except OSError:
+            server = ""
+        winreg.CloseKey(k)
+        if "=" in server:
+            d = {}
+            for part in server.split(";"):
+                if "=" in part:
+                    kk, vv = part.split("=", 1)
+                    d[kk.strip().lower()] = vv.strip()
+            server = d.get("https") or d.get("http") or ""
+        return _parse(server)
+    except Exception:
+        return None
+
+
 def _match_bypass(host, ov):
     if not ov:
         return False
@@ -115,6 +187,11 @@ def proxy_for(host):
     """该目标主机应使用的 (host, port)；None 表示直连。"""
     if _override == "none":
         return None
+    if _override == "force":                      # 强制代理：忽略绕过列表，但本地地址仍直连
+        if _is_local(host):
+            return None
+        px, _ = _load_system()
+        return px or _load_server_any()
     if _override:
         return _override
     if _is_local(host):

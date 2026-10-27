@@ -69,6 +69,8 @@ class Manager:
         self._last_notify = 0.0
         self.config_file = os.path.join(self.data_dir, "config.json")
         self.clipboard_watch = True
+        self.proxy_mode = "auto"            # auto | direct | proxy
+        self._proxy_from_cli = False        # 命令行指定过 --proxy 时，配置不再覆盖
         self._load_config()
         self._load()
         threading.Thread(target=self._saver, daemon=True).start()
@@ -88,8 +90,17 @@ class Manager:
             self.default_conn = _norm_conn(c.get("default_conn", self.default_conn))
             self.limiter.set_bps(int(c.get("speed_limit", 0)))
             self._sem = threading.Semaphore(self.max_parallel)
+            mode = str(c.get("proxy_mode", "auto")).lower()
+            self.proxy_mode = mode if mode in ("auto", "direct", "proxy") else "auto"
         except Exception:
             pass
+        # 命令行没显式指定 --proxy 时，用配置里的网络模式
+        if not self._proxy_from_cli:
+            try:
+                from .proxy import set_override
+                set_override(self.proxy_mode)
+            except Exception:
+                pass
 
     def _save_config(self):
         try:
@@ -98,10 +109,25 @@ class Manager:
                            "download_dir": self.download_dir,
                            "max_parallel": self.max_parallel,
                            "default_conn": self.default_conn,
-                           "speed_limit": self.limiter.bps},
+                           "speed_limit": self.limiter.bps,
+                           "proxy_mode": self.proxy_mode},
                           f, ensure_ascii=False, indent=1)
         except Exception:
             pass
+
+    def set_proxy_mode(self, mode: str):
+        """界面切换网络模式：auto（自动）/ direct（直连）/ proxy（强制代理）。"""
+        mode = str(mode or "auto").lower()
+        if mode not in ("auto", "direct", "proxy"):
+            mode = "auto"
+        self.proxy_mode = mode
+        self._proxy_from_cli = False
+        try:
+            from .proxy import set_override
+            set_override(mode)
+        except Exception:
+            pass
+        self._save_config()
 
     def set_clipboard_watch(self, on: bool):
         self.clipboard_watch = bool(on)
