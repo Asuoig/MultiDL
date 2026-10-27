@@ -418,9 +418,15 @@ class Manager:
             # join 会冻结界面，「全部开始」还会按任务数累乘成几十秒假死。
             # 打个标记，交给 worker 的 finally 自己重启。
             t._resume_pending = True
-            t.message = "正在停止，稍后自动继续"
-            self._notify()
-            return True
+            if not getattr(t, "_started", False):
+                # 竞态：worker 的 finally 可能刚读完 pending=False 就退出，
+                # 这时置位没人消费 → 任务永久停在 paused 且提示"稍后自动继续"。
+                # 复查一次：线程已走到收尾就自己接管，往下走正常 start 路径。
+                t._resume_pending = False
+            else:
+                t.message = "正在停止，稍后自动继续"
+                self._notify()
+                return True
         prev = t.state
         t.resume_task()                       # 置 running（会清 pause 标志）
         if not self.start(tid):

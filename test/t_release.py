@@ -64,7 +64,12 @@ def req(path, method="GET", body=None, headers=None, ctype="application/json"):
         with urllib.request.urlopen(r, timeout=6) as resp:
             return resp.status, dict(resp.headers), resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
+        # 413/415 时服务端会主动断开（不读 body），读响应体可能抛 ConnectionReset
+        try:
+            payload = e.read().decode("utf-8", "replace")
+        except Exception:
+            payload = ""
+        return e.code, dict(e.headers), payload
     except Exception as e:
         return None, {}, f"{type(e).__name__}: {e}"
 
