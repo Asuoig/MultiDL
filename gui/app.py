@@ -457,6 +457,7 @@ class App(tk.Tk):
         self._dl_prev = {}                     # tid -> (已下载字节, 时间戳)，用来算瞬时速度
         self._net_hint_at = 0.0
         self._tray = None
+        self._flash = ("", 0.0)                # (提示文字, 到期时间)：操作无效时在状态栏闪一下
 
         self.title(APP_TITLE)
         self.geometry("1260x680")
@@ -669,14 +670,26 @@ class App(tk.Tk):
     def selected_ids(self):
         return list(self.tree.selection())
 
+    def status(self, msg, secs=4.0):
+        """在状态栏短暂显示一条提示（refresh 每 400ms 会覆盖，所以带到期时间）。"""
+        self._flash = (str(msg), time.monotonic() + secs)
+
     def act(self, action):
         ids = self.selected_ids()
         if not ids:
             return
         fn = {"pause": self.mgr.pause, "resume": self.mgr.resume,
               "cancel": self.mgr.cancel}[action]
-        for tid in ids:
-            fn(tid)
+        done = sum(1 for tid in ids if fn(tid))
+        if not done:
+            # 原来直接吞掉返回值：点了没反应，用户以为程序卡了
+            t = self.mgr.get(ids[0])
+            hint = {
+                "pause": "当前状态不可暂停（可能已完成或已停止）",
+                "resume": "当前状态不可继续（只有已暂停/出错的任务能继续）",
+                "cancel": "当前状态不可取消",
+            }.get(action, "操作未生效")
+            self.status(f"{hint}" + (f"：{t.message}" if t and t.message else ""))
         self.refresh()
 
     def remove_selected(self, with_file=None):
@@ -931,9 +944,12 @@ class App(tk.Tk):
             self.placeholder.place(relx=0.5, rely=0.35, anchor="center")
 
         st = self.mgr.stats()
-        self.st_left.config(
-            text=f"共 {st['total']} 个任务   进行中 {st['active']}   等待 {st['waiting']}   "
-                 f"已完成 {st['done']}")
+        left = (f"共 {st['total']} 个任务   进行中 {st['active']}   等待 {st['waiting']}   "
+                f"已完成 {st['done']}")
+        flash, until = self._flash
+        if flash and time.monotonic() < until:
+            left = f"{flash}    ｜    {left}"
+        self.st_left.config(text=left)
         # 状态栏：总速度 + 总剩余 + 总体进度
         if total_size:
             overall = total_done / total_size * 100.0

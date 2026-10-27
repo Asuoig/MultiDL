@@ -332,6 +332,7 @@ class Task:
         self._runner = False
         self._started = False        # 是否已有线程在跑（start() 幂等用，防止重复起线程）
         self._thread = None          # 当前工作线程（resume 时要等它退出）
+        self._resume_pending = False  # 旧线程还在收尾：等它退出后自己重启（不在界面线程 join）
         self._lock = threading.Lock()
         self._conns: list[Conn] = []
         self._bytes = 0

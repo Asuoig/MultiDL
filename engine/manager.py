@@ -271,11 +271,11 @@ class Manager:
             time.sleep(1.5)
             if not self._dirty:
                 continue
-            self._dirty = False
             try:
                 self._write_state()
             except Exception:
-                pass
+                continue              # 写失败就保持 dirty，下一轮重试（原来会先清标志，直接丢这次变更）
+            self._dirty = False
 
     def save_now(self):
         """退出前同步落盘 —— 只置 dirty 标志的话，进程退出时可能还没写进磁盘。"""
@@ -365,8 +365,19 @@ class Manager:
         t.pause.clear()
         t.state = "queued"
         th = threading.Thread(target=self._worker, args=(t,), daemon=True)
+        try:
+            th.start()
+        except Exception as e:
+            # 线程/内存耗尽时 Thread.start() 会抛异常。若不回滚，_started 永久为 True，
+            # 这个任务就再也起不来了（只有重启进程能救）—— 这是 _started 闸门带来的新风险。
+            with t._lock:
+                t._started = False
+            t.state = "error"
+            t.message = f"无法启动下载线程：{e}"
+            self._dirty = True
+            self._notify()
+            return False
         t._thread = th
-        th.start()
         return True
 
     def _worker(self, t: Task):
@@ -380,6 +391,14 @@ class Manager:
         finally:
             with t._lock:
                 t._started = False
+                pending = getattr(t, "_resume_pending", False)
+                if pending:
+                    t._resume_pending = False
+            # 「暂停后立刻继续」时旧线程还在收尾：由它自己退出后重启，
+            # 这样 resume() 不必在界面线程里 join（那会冻结 GUI）
+            if pending and not t.stop.is_set():
+                t.resume_task()
+                self.start(t.id)
 
     def pause(self, tid):
         t = self.get(tid)
@@ -393,13 +412,15 @@ class Manager:
         t = self.get(tid)
         if not t or t.state not in ("paused", "error"):
             return False
-        # 暂停是协作式的：旧线程可能还在收尾。不等它退出就起新线程，
-        # 两套线程会抢同一个 part 文件，进度直接乱掉（旧版就是这样）。
         th = getattr(t, "_thread", None)
         if th is not None and th.is_alive():
-            th.join(timeout=3.0)
-            if th.is_alive():
-                return False
+            # 旧线程还在收尾。绝不能在这里 join —— resume() 跑在 Tk 主线程，
+            # join 会冻结界面，「全部开始」还会按任务数累乘成几十秒假死。
+            # 打个标记，交给 worker 的 finally 自己重启。
+            t._resume_pending = True
+            t.message = "正在停止，稍后自动继续"
+            self._notify()
+            return True
         prev = t.state
         t.resume_task()                       # 置 running（会清 pause 标志）
         if not self.start(tid):

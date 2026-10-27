@@ -134,7 +134,9 @@ def make_server(mgr: Manager, port: int = 8765):
             return obj if isinstance(obj, dict) else {}
 
         def _static(self, path):
-            # 桌面版不再提供网页界面；保留一个说明页，方便排查端口是否活着
+            # 桌面版不再提供网页界面；只有根路径给一个说明页，其余路径正常 404
+            if path not in ("/", "/index.html"):
+                return _json(self, {"ok": False, "error": "not found"}, 404)
             html = ("<!doctype html><meta charset=utf-8>"
                     "<title>MultiDL</title>"
                     "<body style='font:14px/1.6 Segoe UI,Microsoft YaHei;padding:28px'>"
