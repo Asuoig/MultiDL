@@ -40,6 +40,22 @@ MT_WARMUP = 1.0                     # 丢弃前 1 秒（TCP 慢启动阶段，�
 MT_MAX_TOTAL = 400 * 1024 * 1024    # 精确模式最多读 400MB，避免流量失控
 MT_CONNS = 8                        # 默认并发连接数（与下载引擎默认一致）
 
+# 上传测速端点（接受 POST 并丢弃数据）。走代理时该域名 SSL 常被节点阻断，所以只测直连
+UPLOAD_URL = "https://speed.cloudflare.com/__up"
+UP_DURATION = 3.0
+UP_MAX_TOTAL = 200 * 1024 * 1024
+
+
+def fmt_speed(mbps):
+    """速度双单位：47.35 MB/s (379 Mbps)。"""
+    try:
+        v = float(mbps or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if v <= 0:
+        return "-"
+    return f"{v:.2f} MB/s ({v * 8:.0f} Mbps)"
+
 
 def _log(progress, stage, text, level=None):
     """level: 'ok' | 'warn' | None，供界面着色。"""
@@ -66,6 +82,17 @@ def _level_speed(mbps):
     if not mbps:
         return "warn"
     if mbps >= 5:
+        return "ok"
+    if mbps >= 1:
+        return None
+    return "warn"
+
+
+def _level_up(mbps):
+    """上行带宽阈值比下行低（家宽上行普遍只有下行的 1/10 左右）。"""
+    if not mbps:
+        return "warn"
+    if mbps >= 3:
         return "ok"
     if mbps >= 1:
         return None
@@ -389,7 +416,7 @@ def _try_sources_mt(sources, proxies, progress, stage, conns=MT_CONNS):
             if el - _st["last"] >= 1.5:
                 _st["last"] = el
                 _log(progress, stage,
-                     f"  {_name} 实时 {total / 1048576 / max(el, 0.1):.1f} MB/s")
+                     f"  {_name} 实时 {fmt_speed(total / 1048576 / max(el, 0.1))}")
 
         res = multithread_speed(url, proxies, conns=conns, on_tick=tick)
         if res:
@@ -397,6 +424,95 @@ def _try_sources_mt(sources, proxies, progress, stage, conns=MT_CONNS):
             return res
         _log(progress, stage, f"  {name} 不可用，换下一个")
     return None
+
+
+# ---------------- 上传测速 ----------------
+def _up_worker(host, port, path, counter, stop, cap):
+    """chunked 上传，边发边计数。
+
+    注意：发送速度会被 TCP 发送缓冲区"吸收"而虚高，
+    所以调用方必须等本函数收到服务器响应后再算总时间。
+    """
+    import http.client
+    import ssl
+    conn = None
+    sent = 0
+    try:
+        conn = http.client.HTTPSConnection(host, port, timeout=20,
+                                           context=ssl.create_default_context())
+        conn.putrequest("POST", path)
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("User-Agent", "Mozilla/5.0")
+        conn.endheaders()
+        chunk = b"\0" * 65536
+        while not stop.is_set():
+            conn.send(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            counter.add(len(chunk))
+            sent += len(chunk)
+            if cap and sent >= cap:
+                break
+        conn.send(b"0\r\n\r\n")
+        try:
+            resp = conn.getresponse()
+            resp.read()                    # 等服务器收完 → 数据才真正上线
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
+def upload_speed(url=UPLOAD_URL, conns=MT_CONNS, duration=UP_DURATION,
+                 max_total=UP_MAX_TOTAL, on_tick=None):
+    """多连接上传测速，返回真实上行吞吐（MB/s）。
+
+    关键点：TCP 发送缓冲区会先吞下数据让 send() 立即返回，
+    若只统计"发送阶段"会严重虚高（实测 8 连接 145 Mbps vs 真实 72 Mbps）。
+    所以必须等所有连接收到服务器响应，用「总字节 ÷ 总耗时」算。
+    """
+    u = urlsplit(url)
+    host = u.hostname
+    port = u.port or 443
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    conns = max(1, min(int(conns), 16))
+    cap = max(1, max_total // conns)
+
+    counter = _Counter()
+    stop = threading.Event()
+    threads = []
+    for _ in range(conns):
+        t = threading.Thread(target=_up_worker,
+                             args=(host, port, path, counter, stop, cap), daemon=True)
+        t.start()
+        threads.append(t)
+
+    t0 = time.monotonic()
+    while True:
+        el = time.monotonic() - t0
+        if on_tick:
+            try:
+                on_tick(el, counter.get())
+            except Exception:
+                pass
+        if el >= duration:
+            break
+        time.sleep(0.1)
+
+    stop.set()
+    for t in threads:
+        t.join(timeout=25)
+    elapsed = max(time.monotonic() - t0, 0.01)
+    total = counter.get()
+    if total < 256 * 1024:
+        return None
+    return {"url": url, "mbps": total / elapsed / 1048576.0, "bytes": total,
+            "seconds": elapsed, "conns": conns}
 
 
 # ---------------- 4. 代理链路 ----------------
@@ -453,29 +569,29 @@ def verdicts(res):
     cn_mode = f"{cn_conns} 连接并行" if cn_precise else "单线程"
     cn_peak = cn.get("peak_mbps") or cn_sp
     judge = max(cn_sp, cn_peak)
-    peak_txt = f"，峰值 {cn_peak:.1f}" if cn_peak > cn_sp * 1.15 else ""
+    peak_txt = f"，峰值 {fmt_speed(cn_peak)}" if cn_peak > cn_sp * 1.15 else ""
     if cn_sp:
         if judge < 3:
-            out.append(f"国内直连只有 {cn_sp:.1f} MB/s（{cn_mode}），偏慢 —— "
+            out.append(f"国内直连只有 {fmt_speed(cn_sp)}（{cn_mode}），偏慢 —— "
                        "测速源限速、宽带或线路都可能有问题，可以换多个源再确认。")
         elif judge < 10:
-            out.append(f"国内直连 {cn_sp:.1f} MB/s{peak_txt}（{cn_mode}），属于正常水平。")
+            out.append(f"国内直连 {fmt_speed(cn_sp)}{peak_txt}（{cn_mode}），属于正常水平。")
         else:
-            out.append(f"国内直连 {cn_sp:.1f} MB/s{peak_txt}（{cn_mode}），线路很好。")
+            out.append(f"国内直连 {fmt_speed(cn_sp)}{peak_txt}（{cn_mode}），线路很好。")
 
     # 链路速率对比：多线程才可能跑满链路，单线程跑不满是正常的
     if link and cn_sp:
         link_mb = link / 8.0
         ratio = judge / link_mb if link_mb else 0
         if ratio >= 0.6:
-            out.append(f"已达到网卡链路的 {ratio * 100:.0f}%（{link:.0f} Mbps ≈ "
-                       f"{link_mb:.0f} MB/s），带宽基本跑满。")
+            out.append(f"已达到网卡链路的 {ratio * 100:.0f}%（{link:.0f} Mbps / "
+                       f"{link_mb:.1f} MB/s），带宽基本跑满。")
         elif cn_precise:
-            out.append(f"网卡链路 {link:.0f} Mbps（≈{link_mb:.0f} MB/s），"
+            out.append(f"网卡链路 {link:.0f} Mbps（{link_mb:.1f} MB/s），"
                        f"{cn_conns} 连接并行只跑到 {ratio * 100:.0f}% —— "
                        "瓶颈不在本机网卡，而在宽带套餐、测速源或线路。")
         else:
-            out.append(f"网卡链路 {link:.0f} Mbps（≈{link_mb:.0f} MB/s），"
+            out.append(f"网卡链路 {link:.0f} Mbps（{link_mb:.1f} MB/s），"
                        f"单线程跑到 {ratio * 100:.0f}% —— 单线程跑不满高带宽是正常的，"
                        "想看真实上限请用「精确模式」。")
 
@@ -491,20 +607,21 @@ def verdicts(res):
     # 代理对比
     if px_sp and cn_sp:
         ratio = px_sp / cn_sp
+        pct_txt = f"{ratio * 100:.1f}%" if ratio >= 0.01 else "不到 1%"
         if ratio < 0.2:
-            out.append(f"代理速度只有国内直连的 {ratio * 100:.0f}%"
-                       f"（{px_sp:.1f} vs {cn_sp:.1f} MB/s）—— **瓶颈在代理节点**，"
+            out.append(f"代理速度只有国内直连的 {pct_txt}"
+                       f"（{fmt_speed(px_sp)} vs {fmt_speed(cn_sp)}）—— 【瓶颈在代理节点】，"
                        "换节点或换机场比升级宽带更有用。")
         elif ratio < 0.5:
-            out.append(f"代理速度是国内直连的 {ratio * 100:.0f}%"
-                       f"（{px_sp:.1f} vs {cn_sp:.1f} MB/s）—— 节点带宽偏弱，"
+            out.append(f"代理速度是国内直连的 {pct_txt}"
+                       f"（{fmt_speed(px_sp)} vs {fmt_speed(cn_sp)}）—— 节点带宽偏弱，"
                        "下载大文件建议换节点。")
         elif ratio < 0.8:
-            out.append(f"代理速度是国内直连的 {ratio * 100:.0f}%，节点带宽一般。")
+            out.append(f"代理速度是国内直连的 {pct_txt}，节点带宽一般。")
         else:
-            out.append(f"代理速度达到国内直连的 {ratio * 100:.0f}%，节点质量不错。")
+            out.append(f"代理速度达到国内直连的 {pct_txt}，节点质量不错。")
         if px_sp < 1:
-            out.append(f"不过代理绝对速度只有 {px_sp:.1f} MB/s，即使比例不差，实际下载也会偏慢。")
+            out.append(f"不过代理绝对速度只有 {fmt_speed(px_sp)}，即使比例不差，实际下载也会偏慢。")
     elif res.get("proxy", {}).get("enabled") and not px_sp:
         out.append("代理已配置但测速失败 —— 节点可能不可用或被限速，建议换节点再测。")
     elif not res.get("proxy", {}).get("enabled"):
@@ -515,6 +632,28 @@ def verdicts(res):
     px_rtt = px.get("rtt_ms")
     if px_rtt and px_rtt > 800:
         out.append(f"代理延迟 {px_rtt:.0f} ms 很高，页面/小文件会明显卡顿（大文件受影响小）。")
+
+    # 上传带宽：上行不够/被占满时，下载的 ACK 回传会被拖慢
+    up = res.get("upload") or {}
+    up_sp = up.get("mbps") or 0
+    if up_sp:
+        if up_sp < 1:
+            out.append(f"上传带宽只有 {fmt_speed(up_sp)}，偏低 —— 上传文件、做种、视频通话会卡；"
+                       "如果下载慢的同时后台有程序在占上行（网盘同步、P2P 做种、云备份），"
+                       "TCP 的 ACK 回传被拖慢，下载也会跟着变慢，先把上行占用清掉再测。")
+        elif up_sp < 3:
+            out.append(f"上传 {fmt_speed(up_sp)}，属于常见的家宽不对称上行，日常够用。")
+        else:
+            out.append(f"上传 {fmt_speed(up_sp)}，上行比较充裕。")
+
+        if cn_sp and up_sp:
+            ratio = up_sp / cn_sp
+            if ratio < 0.05:
+                out.append(f"上行只有下行的 {ratio * 100:.1f}%，典型不对称宽带，属正常现象。")
+            elif ratio > 0.6:
+                out.append(f"上行是下行的 {ratio * 100:.0f}%，接近对等带宽。")
+    elif res.get("upload") == {}:
+        pass                                    # 上传测速被跳过/失败，不输出结论
 
     return out
 
@@ -527,7 +666,8 @@ def run(progress=None, precise=True, conns=MT_CONNS):
     False 走单线程快速测速（流量小但受单连接限制）。
     progress(stage, text, level) 用于界面实时输出。
     """
-    res = {"link": {}, "proxy": {}, "dns": {}, "cn": {}, "proxy_test": {}, "verdict": []}
+    res = {"link": {}, "proxy": {}, "dns": {}, "cn": {}, "proxy_test": {},
+           "upload": {}, "verdict": []}
 
     # 1) 本机链路
     _log(progress, "link", "读取网卡链路速率 …")
@@ -535,7 +675,7 @@ def run(progress=None, precise=True, conns=MT_CONNS):
     li = res["link"]
     if li.get("speed_mbps"):
         _log(progress, "link", f"  {li['name']}（{li['type'] or '网卡'}）链路速率 "
-                               f"{li['speed_mbps']:.0f} Mbps ≈ {li['speed_mbps'] / 8:.0f} MB/s", "ok")
+                               f"{li['speed_mbps']:.0f} Mbps ({li['speed_mbps'] / 8:.1f} MB/s)", "ok")
     else:
         _log(progress, "link", "  未能读取链路速率（不影响其他检测）")
 
@@ -582,7 +722,7 @@ def run(progress=None, precise=True, conns=MT_CONNS):
           else _try_sources(CN_SPEED_URLS, None, progress, "cn"))
     if cn:
         res["cn"].update(cn)
-        _log(progress, "cn", f"  {cn['src']} 直连 {cn['mbps']:.2f} MB/s",
+        _log(progress, "cn", f"  {cn['src']} 直连 {fmt_speed(cn['mbps'])}",
              _level_speed(cn["mbps"]))
     else:
         _log(progress, "cn", "  所有国内测速源均不可用", "warn")
@@ -604,14 +744,35 @@ def run(progress=None, precise=True, conns=MT_CONNS):
                _try_sources(OUT_SPEED_URLS, {"http": p, "https": p}, progress, "px"))
         if out:
             res["proxy_test"].update(out)
-            _log(progress, "px", f"  {out['src']} 经代理 {out['mbps']:.2f} MB/s",
+            _log(progress, "px", f"  {out['src']} 经代理 {fmt_speed(out['mbps'])}",
                  _level_speed(out["mbps"]))
         else:
             _log(progress, "px", "  所有国外测速源均不可用（节点可能被限速或不可用）", "warn")
     else:
         _log(progress, "px", "未配置代理，跳过代理链路测试", "warn")
 
-    # 6) 结论
+    # 6) 上传带宽（直连）——上行不够时，下载的 ACK 回传会被拖慢
+    up_conns = conns if precise else 4
+    _log(progress, "up", f"测试上传带宽（直连，{up_conns} 连接）…")
+    up_state = {"last": 0.0}
+
+    def up_tick(el, total):
+        if el < 0.8:
+            return
+        if el - up_state["last"] >= 1.5:
+            up_state["last"] = el
+            _log(progress, "up", f"  已发送 {total / 1048576:.1f} MB …")
+
+    up = upload_speed(conns=up_conns, on_tick=up_tick)
+    if up:
+        res["upload"] = up
+        _log(progress, "up", f"  上传 {fmt_speed(up['mbps'])}（{up['conns']} 连接，"
+                             f"{up['bytes'] / 1048576:.1f} MB / {up['seconds']:.1f}s）",
+             _level_up(up["mbps"]))
+    else:
+        _log(progress, "up", "  上传测速失败（端点不可达，不影响其他结论）", "warn")
+
+    # 7) 结论
     _log(progress, "done", "")
     res["verdict"] = verdicts(res)
     return res

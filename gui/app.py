@@ -280,8 +280,8 @@ class NetDiagDialog(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("网络瓶颈排查")
-        self.geometry("720x520")
-        self.minsize(560, 400)
+        self.geometry("780x600")
+        self.minsize(600, 420)
         self.configure(bg="#f7f8fa")
         self.transient(master)
         self._q = queue.Queue()
@@ -293,7 +293,7 @@ class NetDiagDialog(tk.Toplevel):
         ttk.Label(head, text="逐级测速，定位慢在哪一段",
                   foreground="#5b6472").pack(side="left")
         self.precise = tk.BooleanVar(value=True)
-        ttk.Checkbutton(head, text="精确模式（8 连接并行，最多约 400 MB 流量）",
+        ttk.Checkbutton(head, text="精确模式（8 连接并行，下载+上传共最多约 600 MB 流量）",
                         variable=self.precise).pack(side="right")
 
         box = ttk.Frame(self, padding=(14, 0, 14, 0))
@@ -395,26 +395,35 @@ class NetDiagDialog(tk.Toplevel):
         for v in res.get("verdict") or ["（数据不足，无法判断）"]:
             self._write("  • " + v, "verdict")
         self._section("原始数据")
+        try:
+            from engine.diagnose import fmt_speed
+        except Exception:
+            fmt_speed = lambda v: f"{v:.2f} MB/s"      # noqa: E731
         li, cn, px = res.get("link") or {}, res.get("cn") or {}, res.get("proxy_test") or {}
+        up = res.get("upload") or {}
         if li.get("speed_mbps"):
             self._write(f"  网卡链路：{li.get('name','')} {li['speed_mbps']:.0f} Mbps"
-                        f"（≈{li['speed_mbps']/8:.0f} MB/s）", "stage")
+                        f"（{li['speed_mbps']/8:.1f} MB/s）", "stage")
         if cn.get("rtt_ms"):
             self._write(f"  国内延迟：{cn['rtt_ms']:.0f} ms（{cn.get('rtt_host','')}）", "stage")
         if cn.get("mbps"):
             how = f"{cn.get('conns', 1)} 连接" if cn.get("precise") else "单线程"
             pk = cn.get("peak_mbps")
-            extra = f"，峰值 {pk:.2f}" if pk and pk > cn["mbps"] * 1.15 else ""
-            self._write(f"  国内直连：{cn['mbps']:.2f} MB/s{extra}"
+            extra = f"，峰值 {fmt_speed(pk)}" if pk and pk > cn["mbps"] * 1.15 else ""
+            self._write(f"  国内直连：{fmt_speed(cn['mbps'])}{extra}"
                         f"（{cn.get('src','')}，{how}）", "stage")
         if px.get("rtt_ms"):
             self._write(f"  代理延迟：{px['rtt_ms']:.0f} ms", "stage")
         if px.get("mbps"):
             how = f"{px.get('conns', 1)} 连接" if px.get("precise") else "单线程"
             pk = px.get("peak_mbps")
-            extra = f"，峰值 {pk:.2f}" if pk and pk > px["mbps"] * 1.15 else ""
-            self._write(f"  代理下载：{px['mbps']:.2f} MB/s{extra}"
+            extra = f"，峰值 {fmt_speed(pk)}" if pk and pk > px["mbps"] * 1.15 else ""
+            self._write(f"  代理下载：{fmt_speed(px['mbps'])}{extra}"
                         f"（{px.get('src','')}，{how}）", "stage")
+        if up.get("mbps"):
+            self._write(f"  上传带宽：{fmt_speed(up['mbps'])}"
+                        f"（{up.get('conns', 1)} 连接，{up.get('bytes', 0)/1048576:.1f} MB 已发送）",
+                        "stage")
         d = res.get("dns") or {}
         if d.get("cn") or d.get("out"):
             self._write(f"  DNS 解析：国内 {d.get('cn') or 0:.0f} ms / "
@@ -782,7 +791,7 @@ class App(tk.Tk):
     def about(self):
         messagebox.showinfo(
             "关于",
-            "MultiDL 1.0.16\n\n多线程分段下载器 · 独立实现\n"
+            "MultiDL 1.0.17\n\n多线程分段下载器 · 独立实现\n"
             "· 自适应增连   · 断点续传   · 单文件定位写\n"
             "· 支持 HTTP/HTTPS/FTP/HLS\n\n"
             "纯 Python 标准库实现，无第三方依赖。",
