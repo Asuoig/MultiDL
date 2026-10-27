@@ -18,7 +18,7 @@ import threading
 from logging.handlers import RotatingFileHandler
 
 APP_NAME = "MultiDL"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 
 _root = None          # tkinter 根窗口（装好界面后由 install(root) 赋值）
 _log_file = None

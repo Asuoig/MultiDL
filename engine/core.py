@@ -52,6 +52,7 @@ MAX_CONN_HARD = 32
 GROW_POLL = 0.5
 HANDSHAKE_COST = 1.2
 READ_BLOCK = 1 << 18          # 256 KiB
+MIN_SANE_UNKNOWN = 4096       # 长度未知(chunked)时，小于此字节数视为"假响应"
 PART_SUFFIX = ".dlpart"
 META_SUFFIX = ".dlmeta"
 
@@ -112,11 +113,15 @@ class Chunk:
 
     @property
     def size(self):
-        return self.end - self.start + 1
+        return 0 if self.end < 0 else self.end - self.start + 1
 
     @property
     def remaining(self):
-        return 0 if self.done else max(0, self.end - self.pos + 1)
+        if self.done:
+            return 0
+        if self.end < 0:            # end<0 = 长度未知（chunked），一直读到 EOF
+            return 1
+        return max(0, self.end - self.pos + 1)
 
     def d(self):
         return [self.idx, self.start, self.end, self.pos, 1 if self.done else 0]
@@ -206,17 +211,20 @@ class Conn:
         fh = open(path, "r+b", buffering=0)
         try:
             self._open()
+            unknown = self.c.end < 0            # 长度未知（chunked）：读到 EOF 为止
             buf = bytearray(READ_BLOCK)
-            while self.c.pos <= self.c.end:
+            while unknown or self.c.pos <= self.c.end:
                 if stop.is_set() or pause.is_set():
                     raise Aborted()
-                want = min(READ_BLOCK, self.c.end - self.c.pos + 1)
+                want = READ_BLOCK if unknown else min(READ_BLOCK, self.c.end - self.c.pos + 1)
                 mv = memoryview(buf)[:want]
                 n = self.resp.readinto(mv) if hasattr(self.resp, "readinto") else 0
                 if n == 0:
                     data = self.resp.read1(want)
                     n = len(data)
                     if n == 0:
+                        if unknown:
+                            break                # 正常读完（chunked 以 EOF 结束）
                         raise IOError("unexpected EOF")
                     mv = data
                 limiter.consume(n, stop=stop.is_set)
@@ -337,6 +345,8 @@ class Task:
 
     # ---------- 分块状态旁车 ----------
     def _save_meta(self):
+        if self.size <= 0:
+            return                       # 长度未知（chunked）无法安全续传，不写进度
         try:
             with open(self.meta_path, "w", encoding="utf-8") as f:
                 json.dump({"url": self.url, "size": self.size, "etag": self.etag,
@@ -352,6 +362,8 @@ class Task:
             if d.get("url") != self.url:
                 return False
             self.size = d.get("size") or 0
+            if self.size <= 0:
+                return False             # 长度未知的旧进度不可信，重新下载
             self.etag = d.get("etag")
             self.last_modified = d.get("lm")
             self.chunks = [Chunk.load(a) for a in d.get("chunks") or []]
@@ -506,6 +518,9 @@ class Task:
                 self._runner = False
 
             if all(c.done for c in self.chunks):
+                if self.size <= 0 and self.downloaded < MIN_SANE_UNKNOWN:
+                    # chunked 无长度却只拿到极少字节：服务器反爬的"假响应"（如 USTC 返回 0~1 字节）
+                    raise IOError(f"服务器返回异常小的响应（{self.downloaded} 字节），疑似被反爬拦截")
                 self._finalize()
             elif self.stop.is_set():
                 self.state = "canceled"
@@ -671,7 +686,7 @@ class Task:
         with open(self.part_path, "wb") as f:
             if self.size:
                 f.truncate(self.size)
-        self.chunks = [Chunk(0, 0, max(self.size - 1, 0))]
+        self.chunks = [Chunk(0, 0, self.size - 1 if self.size > 0 else -1)]
         self.downloaded = 0
         self._bytes = 0
         c = Conn(self, self.chunks[0])
@@ -696,7 +711,7 @@ class Task:
     def _initial_chunks(self):
         """按文件大小一次性切成 n 段（大文件直接铺满连接数）。"""
         if self.size <= 0:
-            return [Chunk(0, 0, 0)]
+            return [Chunk(0, 0, -1)]          # end=-1：长度未知，流式读到 EOF
         if not self.supports_range:
             return [Chunk(0, 0, self.size - 1)]
         n = max(1, min(self.max_conn, self.size // self.BYTES_PER_CONN))
